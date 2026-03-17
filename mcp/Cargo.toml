@@ -1,0 +1,28 @@
+[package]
+name = "agent-browser-mcp"
+description = "MCP Server for browser automation - integrates with Claude Code, Cursor, and other MCP clients"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+exclude.workspace = true
+
+[[bin]]
+name = "agent-browser-mcp"
+path = "src/main.rs"
+
+[dependencies]
+agent-browser-core.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

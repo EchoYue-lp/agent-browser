@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "mcp",
+    "http",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["EchoYue"]
+license = "MIT"
+repository = "https://github.com/EchoYue/agent-browser"
+homepage = "https://github.com/EchoYue/agent-browser"
+documentation = "https://docs.rs/agent-browser-core"
+readme = "README.md"
+description = "Browser automation toolkit for AI agents"
+keywords = ["browser", "automation", "agent", "mcp", "cdp"]
+categories = ["web-programming", "development-tools", "api-bindings"]
+exclude = [
+    "docs/",
+    ".github/",
+    "examples/",
+    "tests/",
+    "*.md",
+    "!README.md",
+]
+
+[workspace.dependencies]
+# 内部 crates
+agent-browser-core = { path = "core" }
+
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# 浏览器控制
+chromiumoxide = { version = "0.9", default-features = true }
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 错误处理
+anyhow = "1.0"
+thiserror = "2.0"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 工具
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"
+
+# MCP 协议
+rmcp = "0.1"
+
+# HTTP 相关
+axum = { version = "0.7", features = ["ws", "macros"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
