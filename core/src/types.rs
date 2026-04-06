@@ -276,7 +276,6 @@ pub enum DownloadStatus {
     InProgress,
     Completed,
     Canceled,
-    Interrupted,
 }
 
 /// Keyboard modifier keys.

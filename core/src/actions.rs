@@ -344,11 +344,13 @@ async fn dispatch_drag(
     source_ref_id: &str,
     target_ref_id: &str,
 ) -> Result<ActionResult> {
+    let src_attr = format!("[data-agent-ref={:?}]", source_ref_id);
+    let tgt_attr = format!("[data-agent-ref={:?}]", target_ref_id);
     let js = format!(
         r#"
         (() => {{
-            const src = document.querySelector('[data-agent-ref="{src}"]');
-            const tgt = document.querySelector('[data-agent-ref="{tgt}"]');
+            const src = document.querySelector({src_sel:?});
+            const tgt = document.querySelector({tgt_sel:?});
             if (!src) return {{ok:false,error:'source not found'}};
             if (!tgt) return {{ok:false,error:'target not found'}};
             const dt = new DataTransfer();
@@ -360,8 +362,8 @@ async fn dispatch_drag(
             return {{ok:true}};
         }})()
         "#,
-        src = source_ref_id,
-        tgt = target_ref_id
+        src_sel = src_attr,
+        tgt_sel = tgt_attr
     );
 
     let result: serde_json::Value = page

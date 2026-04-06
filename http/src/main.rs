@@ -49,7 +49,7 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
@@ -65,7 +65,7 @@ use agent_browser_core::{
 /// Global application state
 pub struct AppState {
     /// Browser engine instance
-    pub engine: Arc<Mutex<BrowserEngine>>,
+    pub engine: Arc<BrowserEngine>,
     /// Configuration
     pub config: HttpConfig,
     /// Event broadcast channel for WebSocket
@@ -372,7 +372,7 @@ pub async fn navigate(
 ) -> Result<Json<ApiSuccess<NavigateResponse>>, (StatusCode, Json<ApiError>)> {
     info!("Navigate: {}", req.url);
 
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let result = engine.navigate(&req.url).await.map_err(|e| {
         (
@@ -398,7 +398,7 @@ pub async fn navigate(
 pub async fn snapshot(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiSuccess<SnapshotResponse>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let snap = engine.snapshot().await.map_err(|e| {
         (
@@ -434,7 +434,7 @@ pub async fn act(
 ) -> Result<Json<ApiSuccess<ActionResult>>, (StatusCode, Json<ApiError>)> {
     info!("Act: {} on {}", req.action, req.ref_id);
 
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let result = match req.action.as_str() {
         "click" => engine.click(&req.ref_id).await,
@@ -528,7 +528,7 @@ pub async fn screenshot(
     State(state): State<Arc<AppState>>,
     Query(req): Query<ScreenshotQuery>,
 ) -> Result<Json<ApiSuccess<ScreenshotResponse>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let options = ScreenshotOptions {
         full_page: req.full_page,
@@ -557,7 +557,7 @@ pub async fn wait(
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
     let timeout = req.timeout_ms.unwrap_or(state.config.default_timeout_ms);
 
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     if let Some(ref selector) = req.selector {
         engine
@@ -597,7 +597,7 @@ pub async fn evaluate(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EvaluateRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let value = engine.evaluate(&req.script).await.map_err(|e| {
         (
@@ -613,7 +613,7 @@ pub async fn evaluate(
 pub async fn get_cookies(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiSuccess<Vec<agent_browser_core::CookieInfo>>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let cookies = engine.get_cookies().await.map_err(|e| {
         (
@@ -630,7 +630,7 @@ pub async fn set_cookies(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SetCookiesRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     engine.set_cookies(req.cookies).await.map_err(|e| {
         (
@@ -646,7 +646,7 @@ pub async fn set_cookies(
 pub async fn list_tabs(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiSuccess<Vec<TabInfo>>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let tabs = engine.list_tabs().await.map_err(|e| {
         (
@@ -663,7 +663,7 @@ pub async fn activate_tab(
     State(state): State<Arc<AppState>>,
     Path(tab_id): Path<String>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     engine.activate_tab(&tab_id).await.map_err(|e| {
         (
@@ -680,7 +680,7 @@ pub async fn close_tab(
     State(state): State<Arc<AppState>>,
     Path(tab_id): Path<String>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     engine.close_tab(&tab_id).await.map_err(|e| {
         (
@@ -700,7 +700,7 @@ pub async fn upload(
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
     info!("Upload: {} -> ref_id={}", req.file_path, req.ref_id);
 
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     engine
         .upload_file(&req.ref_id, &req.file_path)
@@ -720,7 +720,7 @@ pub async fn dialog(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DialogRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     engine
         .setup_dialog_handler(req.accept, req.prompt_text)
@@ -739,7 +739,7 @@ pub async fn dialog(
 pub async fn shutdown(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     engine.shutdown().await.map_err(|e| {
         (
@@ -765,7 +765,7 @@ pub async fn enter_iframe(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EnterIframeRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let depth = engine.enter_iframe(&req.ref_id).await.map_err(|e| {
         (
@@ -783,7 +783,7 @@ pub async fn enter_iframe(
 pub async fn exit_iframe(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let depth = engine.exit_iframe().await.map_err(|e| {
         (
@@ -799,7 +799,7 @@ pub async fn exit_iframe(
 pub async fn exit_all_iframes(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     engine.exit_all_iframes().await.map_err(|e| {
         (
@@ -838,7 +838,7 @@ pub async fn download_file(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DownloadFileRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let options = agent_browser_core::DownloadOptions {
         save_path: req.save_path,
@@ -869,7 +869,7 @@ pub async fn click_and_download(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ClickDownloadRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let options = agent_browser_core::DownloadOptions {
         save_path: req.save_path,
@@ -916,7 +916,7 @@ pub async fn press_key(
     State(state): State<Arc<AppState>>,
     Json(req): Json<PressKeyRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let modifiers: Vec<agent_browser_core::KeyModifier> = req
         .modifiers
@@ -951,7 +951,7 @@ pub async fn send_shortcut(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ShortcutRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let result = engine.send_shortcut(&req.shortcut).await.map_err(|e| {
         (
@@ -976,7 +976,7 @@ pub async fn click_selector(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SelectorRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let result = engine
         .click_selector(&req.selector, req.timeout_ms)
@@ -1000,7 +1000,7 @@ pub async fn type_selector(
     State(state): State<Arc<AppState>>,
     Json(req): Json<TypeSelectorRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let result = engine
         .type_selector(
@@ -1024,7 +1024,7 @@ pub async fn get_text(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SelectorRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let text = engine
         .get_text(&req.selector, req.timeout_ms)
@@ -1048,7 +1048,7 @@ pub async fn get_attribute(
     State(state): State<Arc<AppState>>,
     Json(req): Json<GetAttributeRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let value = engine
         .get_attribute(&req.selector, &req.attribute, req.timeout_ms)
@@ -1073,7 +1073,7 @@ pub async fn element_exists(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SelectorRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let exists = engine.element_exists(&req.selector).await.map_err(|e| {
         (
@@ -1094,7 +1094,7 @@ pub async fn hover_selector(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SelectorRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let result = engine
         .hover_selector(&req.selector, req.timeout_ms)
@@ -1118,7 +1118,7 @@ pub async fn select_option(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SelectOptionRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let result = engine
         .select_option(
@@ -1147,7 +1147,7 @@ pub async fn expand_and_click_submenu(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SubmenuRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = state.engine.lock().await;
+    let engine = &state.engine;
 
     let result = engine
         .expand_and_click_submenu(&req.menu_selector, &req.submenu_selector, req.timeout_ms)
@@ -1302,7 +1302,7 @@ pub async fn run_server(config: HttpConfig) -> anyhow::Result<()> {
 
     // Create app state
     let state = Arc::new(AppState {
-        engine: Arc::new(Mutex::new(engine)),
+        engine: Arc::new(engine),
         config: config.clone(),
         event_tx,
     });

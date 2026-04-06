@@ -366,6 +366,29 @@ async fn process_ax_nodes(
     ax_nodes: &[chromiumoxide::cdp::browser_protocol::accessibility::AxNode],
     start_counter: u32,
 ) -> Result<(Vec<SnapshotNode>, u32)> {
+    process_ax_nodes_impl(page, ax_nodes, start_counter, true).await
+}
+
+/// 处理 AX 节点并构建树（用于 iframe 内部快照）
+///
+/// 与 process_ax_nodes 类似，但不尝试注入 data-agent-ref 属性
+pub async fn process_ax_nodes_in_frame(
+    _page: &Page,
+    ax_nodes: &[chromiumoxide::cdp::browser_protocol::accessibility::AxNode],
+    start_counter: u32,
+) -> Result<(Vec<SnapshotNode>, u32)> {
+    process_ax_nodes_impl(_page, ax_nodes, start_counter, false).await
+}
+
+/// AX 节点处理的通用实现
+///
+/// 当 `inject_refs` 为 true 时，会批量注入 `data-agent-ref` 属性到 DOM 元素。
+async fn process_ax_nodes_impl(
+    page: &Page,
+    ax_nodes: &[chromiumoxide::cdp::browser_protocol::accessibility::AxNode],
+    start_counter: u32,
+    inject_refs: bool,
+) -> Result<(Vec<SnapshotNode>, u32)> {
     use chromiumoxide::cdp::browser_protocol::dom::{
         PushNodesByBackendIdsToFrontendParams, SetAttributeValueParams,
     };
@@ -384,14 +407,16 @@ async fn process_ax_nodes(
         let ref_id = format!("ax{}", counter);
         ax_id_to_ref.insert(String::from(node.node_id.as_ref()), ref_id.clone());
 
-        if let Some(backend_id) = node.backend_dom_node_id {
-            backend_ids.push(backend_id);
-            ref_ids_for_backend.push(ref_id);
+        if inject_refs {
+            if let Some(backend_id) = node.backend_dom_node_id {
+                backend_ids.push(backend_id);
+                ref_ids_for_backend.push(ref_id);
+            }
         }
     }
 
     // 批量注入 data-agent-ref 属性
-    if !backend_ids.is_empty() {
+    if inject_refs && !backend_ids.is_empty() {
         match page
             .execute(PushNodesByBackendIdsToFrontendParams {
                 backend_node_ids: backend_ids,
@@ -466,136 +491,15 @@ async fn process_ax_nodes(
     }
 
     // 构建树结构
-    let mut has_parent: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for node in ax_nodes {
-        if node.ignored {
-            continue;
-        }
-        if let Some(child_ids) = &node.child_ids {
-            for cid in child_ids {
-                has_parent.insert(String::from(cid.as_ref()));
-            }
-        }
-    }
-
-    let root_ax_ids: Vec<&str> = ax_nodes
-        .iter()
-        .filter(|n| !n.ignored && !has_parent.contains(n.node_id.as_ref()))
-        .map(|n| n.node_id.as_ref())
-        .collect();
-
-    let child_ids_map: HashMap<&str, Vec<&str>> = ax_nodes
-        .iter()
-        .filter(|n| !n.ignored)
-        .map(|n| {
-            let cids: Vec<&str> = n
-                .child_ids
-                .as_deref()
-                .unwrap_or(&[])
-                .iter()
-                .map(|id| id.as_ref())
-                .collect();
-            (n.node_id.as_ref(), cids)
-        })
-        .collect();
-
-    fn build_subtree(
-        ax_id: &str,
-        node_map: &mut HashMap<String, SnapshotNode>,
-        child_ids_map: &HashMap<&str, Vec<&str>>,
-    ) -> Option<SnapshotNode> {
-        let mut node = node_map.remove(ax_id)?;
-        if let Some(cids) = child_ids_map.get(ax_id) {
-            for cid in cids {
-                if let Some(child) = build_subtree(cid, node_map, child_ids_map) {
-                    node.children.push(child);
-                }
-            }
-        }
-        Some(node)
-    }
-
-    let mut roots: Vec<SnapshotNode> = Vec::new();
-    for ax_id in root_ax_ids {
-        if let Some(root) = build_subtree(ax_id, &mut node_map, &child_ids_map) {
-            roots.push(root);
-        }
-    }
-
+    let roots = build_ax_tree(ax_nodes, &mut node_map);
     Ok((roots, counter))
 }
 
-/// 处理 AX 节点并构建树（用于 iframe 内部快照）
-///
-/// 与 process_ax_nodes 类似，但不尝试注入 data-agent-ref 属性
-pub async fn process_ax_nodes_in_frame(
-    _page: &Page,
+/// 从 AX 节点构建树结构
+fn build_ax_tree(
     ax_nodes: &[chromiumoxide::cdp::browser_protocol::accessibility::AxNode],
-    start_counter: u32,
-) -> Result<(Vec<SnapshotNode>, u32)> {
-    // 为非忽略节点分配 ref_id
-    let mut ax_id_to_ref: HashMap<String, String> = HashMap::new();
-    let mut counter = start_counter;
-
-    for node in ax_nodes {
-        if node.ignored {
-            continue;
-        }
-        counter += 1;
-        let ref_id = format!("ax{}", counter);
-        ax_id_to_ref.insert(String::from(node.node_id.as_ref()), ref_id);
-    }
-
-    // 构建节点映射
-    let mut node_map: HashMap<String, SnapshotNode> = HashMap::new();
-
-    for node in ax_nodes {
-        if node.ignored {
-            continue;
-        }
-
-        let ref_id = ax_id_to_ref
-            .get(node.node_id.as_ref())
-            .cloned()
-            .unwrap_or_else(|| String::from(node.node_id.as_ref()));
-
-        let role = extract_ax_str(&node.role).unwrap_or_else(|| "generic".to_string());
-        let name = extract_ax_str(&node.name).unwrap_or_default();
-        let description = extract_ax_str(&node.description);
-        let value = extract_ax_str(&node.value);
-
-        let mut attributes: HashMap<String, String> = HashMap::new();
-        if let Some(props) = &node.properties {
-            for prop in props {
-                if let Some(v) = prop.value.value.as_ref() {
-                    let key = prop.name.as_ref().to_string();
-                    let val = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    if !val.is_empty() && val != "null" && val != "false" {
-                        attributes.insert(key, val);
-                    }
-                }
-            }
-        }
-
-        node_map.insert(
-            String::from(node.node_id.as_ref()),
-            SnapshotNode {
-                ref_id,
-                role,
-                name,
-                value,
-                description,
-                bounds: None,
-                attributes,
-                children: Vec::new(),
-            },
-        );
-    }
-
-    // 构建树结构
+    node_map: &mut HashMap<String, SnapshotNode>,
+) -> Vec<SnapshotNode> {
     let mut has_parent: std::collections::HashSet<String> = std::collections::HashSet::new();
     for node in ax_nodes {
         if node.ignored {
@@ -647,12 +551,12 @@ pub async fn process_ax_nodes_in_frame(
 
     let mut roots: Vec<SnapshotNode> = Vec::new();
     for ax_id in root_ax_ids {
-        if let Some(root) = build_subtree(ax_id, &mut node_map, &child_ids_map) {
+        if let Some(root) = build_subtree(ax_id, node_map, &child_ids_map) {
             roots.push(root);
         }
     }
 
-    Ok((roots, counter))
+    roots
 }
 
 /// 从 AxValue 提取字符串

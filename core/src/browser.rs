@@ -82,6 +82,16 @@ pub struct IframeContext {
 /// let engine = BrowserEngine::new(BrowserConfig::headed());
 /// engine.navigate("https://example.com").await?;
 /// let snapshot = engine.snapshot().await?;
+/// Combined tab state to prevent deadlocks from acquiring multiple locks.
+struct TabState {
+    /// Active page.
+    active_page: Option<Page>,
+    /// Tab mapping (tab_id -> Page).
+    tabs: HashMap<String, Page>,
+    /// Active tab_id.
+    active_tab_id: Option<String>,
+}
+
 /// engine.click("ax1").await?;
 /// engine.shutdown().await?;
 /// # Ok(())
@@ -90,12 +100,8 @@ pub struct IframeContext {
 pub struct BrowserEngine {
     /// Browser instance.
     browser: Mutex<Option<Arc<Browser>>>,
-    /// Active page.
-    active_page: Mutex<Option<Page>>,
-    /// Tab mapping (tab_id -> Page).
-    tabs: Mutex<HashMap<String, Page>>,
-    /// Active tab_id.
-    active_tab_id: Mutex<Option<String>>,
+    /// Combined tab state (single lock to prevent deadlocks).
+    tab_state: Mutex<TabState>,
     /// Configuration.
     config: BrowserConfig,
     /// iframe context stack (supports nested iframes).
@@ -120,9 +126,11 @@ impl BrowserEngine {
         let (download_events, _) = broadcast::channel(16);
         Self {
             browser: Mutex::new(None),
-            active_page: Mutex::new(None),
-            tabs: Mutex::new(HashMap::new()),
-            active_tab_id: Mutex::new(None),
+            tab_state: Mutex::new(TabState {
+                active_page: None,
+                tabs: HashMap::new(),
+                active_tab_id: None,
+            }),
             config,
             iframe_stack: Mutex::new(Vec::new()),
             iframe_mapping: Mutex::new(HashMap::new()),
@@ -226,8 +234,8 @@ impl BrowserEngine {
     /// 获取或创建活动页面
     async fn get_or_create_page(&self) -> Result<Page> {
         // 检查现有活动页面
-        let mut page_guard = self.active_page.lock().await;
-        if let Some(ref page) = *page_guard {
+        let mut state = self.tab_state.lock().await;
+        if let Some(ref page) = state.active_page {
             // 检查页面是否仍然有效
             if page.url().await.is_ok() {
                 return Ok(page.clone());
@@ -241,14 +249,19 @@ impl BrowserEngine {
             .await
             .map_err(|e| Error::Cdp(e.to_string()))?;
 
-        *page_guard = Some(page.clone());
+        // 在页面加载前注入 stealth 脚本
+        if self.config.stealth {
+            self.register_stealth_scripts(&page).await?;
+        }
+
+        state.active_page = Some(page.clone());
         Ok(page)
     }
 
     /// 获取当前活动页面
     pub async fn active_page(&self) -> Result<Page> {
-        let page_guard = self.active_page.lock().await;
-        page_guard.clone().ok_or(Error::NoActivePage)
+        let state = self.tab_state.lock().await;
+        state.active_page.clone().ok_or(Error::NoActivePage)
     }
 
     /// 导航到 URL
@@ -284,9 +297,20 @@ impl BrowserEngine {
 
         info!("Navigated to: {} (title: {})", final_url, title);
 
-        // 如果启用了反检测，注入脚本
-        if self.config.stealth {
-            self.inject_stealth_scripts(&page).await?;
+        // 注册到 tabs（如果尚未注册）
+        {
+            let mut state = self.tab_state.lock().await;
+            let active_id = state.active_tab_id.clone();
+            if let Some(ref existing_id) = active_id {
+                // 确保活动页在 tabs 中
+                if !state.tabs.contains_key(existing_id) {
+                    state.tabs.insert(existing_id.clone(), page.clone());
+                }
+            } else {
+                let tab_id = format!("tab-{}", uuid::Uuid::new_v4());
+                state.tabs.insert(tab_id.clone(), page.clone());
+                state.active_tab_id = Some(tab_id);
+            }
         }
 
         Ok(crate::types::NavigateResult {
@@ -296,10 +320,11 @@ impl BrowserEngine {
         })
     }
 
-    /// 注入反检测脚本
+    /// 注册反检测脚本（在每个新文档加载前自动执行）
     ///
-    /// 隐藏 WebDriver 等自动化特征
-    async fn inject_stealth_scripts(&self, page: &Page) -> Result<()> {
+    /// 使用 CDP Page.addScriptToEvaluateOnNewDocument 在页面 JS 执行之前注入脚本，
+    /// 确保反检测在页面检测脚本运行之前生效。
+    async fn register_stealth_scripts(&self, page: &Page) -> Result<()> {
         let stealth_js = r#"
             // 隐藏 webdriver 标志
             Object.defineProperty(navigator, 'webdriver', {
@@ -355,11 +380,11 @@ impl BrowserEngine {
             console.log('[Stealth] Anti-detection scripts injected');
         "#;
 
-        page.evaluate(stealth_js)
+        page.evaluate_on_new_document(stealth_js)
             .await
             .map_err(|e| Error::JavaScript(e.to_string()))?;
 
-        debug!("Stealth scripts injected successfully");
+        debug!("Stealth scripts registered with addScriptToEvaluateOnNewDocument");
         Ok(())
     }
 
@@ -401,14 +426,14 @@ impl BrowserEngine {
         // 点击元素
         let click_script = format!(
             r#"(function() {{
-                const el = document.querySelector('{}');
+                const el = document.querySelector({sel:?});
                 if (el) {{
                     el.click();
                     return {{ clicked: true, tagName: el.tagName, text: el.textContent.substring(0, 50) }};
                 }}
                 return {{ clicked: false, error: 'Element not found' }};
             }})()"#,
-            selector.replace('\'', "\\'")
+            sel = selector
         );
 
         let result: serde_json::Value = page
@@ -464,14 +489,14 @@ impl BrowserEngine {
         // 输入文本
         let type_script = format!(
             r#"(function() {{
-                const el = document.querySelector('{}');
+                const el = document.querySelector({sel:?});
                 if (!el) return {{ success: false, error: 'Element not found' }};
 
                 el.focus();
-                if ({}) {{
+                if ({clear}) {{
                     el.value = '';
                 }}
-                el.value += '{}';
+                el.value += {text:?};
 
                 // 触发事件
                 el.dispatchEvent(new Event('input', {{ bubbles: true }}));
@@ -479,9 +504,9 @@ impl BrowserEngine {
 
                 return {{ success: true, value: el.value }};
             }})()"#,
-            selector.replace('\'', "\\'"),
-            clear_first,
-            text.replace('\'', "\\'")
+            sel = selector,
+            clear = clear_first,
+            text = text
         );
 
         let result: serde_json::Value = page
@@ -517,8 +542,8 @@ impl BrowserEngine {
         self.wait_for_selector(selector, timeout).await?;
 
         let script = format!(
-            r#"document.querySelector('{}')?.textContent?.trim() || ''"#,
-            selector.replace('\'', "\\'")
+            r#"document.querySelector({sel:?})?.textContent?.trim() || ''"#,
+            sel = selector
         );
 
         let result: String = page
@@ -546,9 +571,9 @@ impl BrowserEngine {
         self.wait_for_selector(selector, timeout).await?;
 
         let script = format!(
-            r#"document.querySelector('{}')?.getAttribute('{}')"#,
-            selector.replace('\'', "\\'"),
-            attribute.replace('\'', "\\'")
+            r#"document.querySelector({sel:?})?.getAttribute({attr:?})"#,
+            sel = selector,
+            attr = attribute
         );
 
         let result: Option<String> = page
@@ -566,8 +591,8 @@ impl BrowserEngine {
         let page = self.active_page().await?;
 
         let script = format!(
-            r#"document.querySelector('{}') !== null"#,
-            selector.replace('\'', "\\'")
+            r#"document.querySelector({sel:?}) !== null"#,
+            sel = selector
         );
 
         let result: bool = page
@@ -641,10 +666,10 @@ impl BrowserEngine {
         let script = if by_text {
             format!(
                 r#"(function() {{
-                    const select = document.querySelector('{}');
+                    const select = document.querySelector({sel:?});
                     if (select && select.tagName === 'SELECT') {{
                         for (let opt of select.options) {{
-                            if (opt.text === '{}') {{
+                            if (opt.text === {val:?}) {{
                                 select.value = opt.value;
                                 select.dispatchEvent(new Event('change', {{ bubbles: true }}));
                                 return {{ success: true, selected: opt.text }};
@@ -653,22 +678,22 @@ impl BrowserEngine {
                     }}
                     return {{ success: false, error: 'Option not found' }};
                 }})()"#,
-                select_selector.replace('\'', "\\'"),
-                value.replace('\'', "\\'")
+                sel = select_selector,
+                val = value
             )
         } else {
             format!(
                 r#"(function() {{
-                    const select = document.querySelector('{}');
+                    const select = document.querySelector({sel:?});
                     if (select && select.tagName === 'SELECT') {{
-                        select.value = '{}';
+                        select.value = {val:?};
                         select.dispatchEvent(new Event('change', {{ bubbles: true }}));
                         return {{ success: true, selected: select.value }};
                     }}
                     return {{ success: false, error: 'Not a select element' }};
                 }})()"#,
-                select_selector.replace('\'', "\\'"),
-                value.replace('\'', "\\'")
+                sel = select_selector,
+                val = value
             )
         };
 
@@ -720,7 +745,7 @@ impl BrowserEngine {
 
         let script = format!(
             r#"(function() {{
-                const el = document.querySelector('{}');
+                const el = document.querySelector({sel:?});
                 if (!el) return {{ success: false, error: 'Element not found' }};
 
                 const rect = el.getBoundingClientRect();
@@ -742,7 +767,7 @@ impl BrowserEngine {
 
                 return {{ success: true, x: x, y: y }};
             }})()"#,
-            selector.replace('\'', "\\'")
+            sel = selector
         );
 
         let result: serde_json::Value = page
@@ -980,10 +1005,12 @@ impl BrowserEngine {
     /// 关闭浏览器
     pub async fn shutdown(&self) -> Result<()> {
         let mut browser_guard = self.browser.lock().await;
-        let mut page_guard = self.active_page.lock().await;
+        let mut state = self.tab_state.lock().await;
 
         // 清空活动页面
-        *page_guard = None;
+        state.active_page = None;
+        state.tabs.clear();
+        state.active_tab_id = None;
 
         if let Some(browser) = browser_guard.take() {
             // 关闭所有页面
@@ -1087,14 +1114,13 @@ impl BrowserEngine {
 impl BrowserEngine {
     /// 列出所有标签页
     pub async fn list_tabs(&self) -> Result<Vec<TabInfo>> {
-        let tabs = self.tabs.lock().await;
-        let active_id = self.active_tab_id.lock().await.clone();
+        let state = self.tab_state.lock().await;
 
         let mut result = Vec::new();
-        for (tab_id, page) in tabs.iter() {
+        for (tab_id, page) in state.tabs.iter() {
             let url = page.url().await.ok().flatten().unwrap_or_default();
             let title = page.get_title().await.ok().flatten().unwrap_or_default();
-            let active = Some(tab_id.as_str()) == active_id.as_deref();
+            let active = Some(tab_id.as_str()) == state.active_tab_id.as_deref();
 
             result.push(TabInfo {
                 tab_id: tab_id.clone(),
@@ -1109,17 +1135,14 @@ impl BrowserEngine {
 
     /// 激活标签页
     pub async fn activate_tab(&self, tab_id: &str) -> Result<()> {
-        let tabs = self.tabs.lock().await;
+        let mut state = self.tab_state.lock().await;
 
-        if !tabs.contains_key(tab_id) {
+        if !state.tabs.contains_key(tab_id) {
             return Err(Error::Other(format!("Tab not found: {}", tab_id)));
         }
 
-        let mut active_id = self.active_tab_id.lock().await;
-        let mut active_page = self.active_page.lock().await;
-
-        *active_id = Some(tab_id.to_string());
-        *active_page = tabs.get(tab_id).cloned();
+        state.active_tab_id = Some(tab_id.to_string());
+        state.active_page = state.tabs.get(tab_id).cloned();
 
         info!("Activated tab: {}", tab_id);
         Ok(())
@@ -1127,9 +1150,10 @@ impl BrowserEngine {
 
     /// 关闭标签页
     pub async fn close_tab(&self, tab_id: &str) -> Result<()> {
-        let mut tabs = self.tabs.lock().await;
+        let mut state = self.tab_state.lock().await;
 
-        let page = tabs
+        let page = state
+            .tabs
             .remove(tab_id)
             .ok_or_else(|| Error::Other(format!("Tab not found: {}", tab_id)))?;
 
@@ -1137,11 +1161,9 @@ impl BrowserEngine {
         page.close().await.map_err(|e| Error::Cdp(e.to_string()))?;
 
         // 如果关闭的是活动标签页，切换到下一个
-        let mut active_id = self.active_tab_id.lock().await;
-        if active_id.as_deref() == Some(tab_id) {
-            *active_id = tabs.keys().next().cloned();
-            let mut active_page = self.active_page.lock().await;
-            *active_page = active_id.as_ref().and_then(|id| tabs.get(id).cloned());
+        if state.active_tab_id.as_deref() == Some(tab_id) {
+            state.active_tab_id = state.tabs.keys().next().cloned();
+            state.active_page = state.active_tab_id.as_ref().and_then(|id| state.tabs.get(id).cloned());
         }
 
         info!("Closed tab: {}", tab_id);
@@ -1923,8 +1945,7 @@ impl BrowserEngine {
                     // 检查是否完成
                     match state {
                         DownloadStatus::Completed
-                        | DownloadStatus::Canceled
-                        | DownloadStatus::Interrupted => {
+                        | DownloadStatus::Canceled => {
                             let download_dir = self.download_dir.lock().await.clone();
                             let filename = format!("download_{}", event.guid);
                             let file_path = if let Some(ref dir) = download_dir {

@@ -45,7 +45,6 @@
 //! | browser_wait | 等待 |
 //! | browser_evaluate | 执行 JavaScript |
 
-use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use agent_browser_core::snapshot::format_snapshot;
@@ -81,12 +80,16 @@ async fn run_server() -> anyhow::Result<()> {
     info!("Starting Echo Browser MCP Server (stdio mode)");
 
     let state = Arc::new(ServerState::new());
-    let stdin = io::stdin();
-    let stdout = io::stdout();
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let stdin = tokio::io::stdin();
+    let reader = BufReader::new(stdin);
+    let mut lines = reader.lines();
+    let mut stdout = tokio::io::stdout();
 
     // 读取 JSON-RPC 消息
-    for line in stdin.lock().lines() {
-        let line = line?;
+    while let Some(line) = lines.next_line().await? {
         if line.is_empty() {
             continue;
         }
@@ -106,9 +109,9 @@ async fn run_server() -> anyhow::Result<()> {
 
         info!("Sending: {}", response_json);
 
-        let mut stdout = stdout.lock();
-        writeln!(stdout, "{}", response_json)?;
-        stdout.flush()?;
+        stdout.write_all(response_json.as_bytes()).await?;
+        stdout.write_all(b"\n").await?;
+        stdout.flush().await?;
     }
 
     Ok(())
@@ -465,7 +468,7 @@ async fn main() -> anyhow::Result<()> {
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(tracing::Level::INFO.into()),
         )
-        .with_writer(io::stderr) // 日志输出到 stderr，避免干扰 stdio 协议
+        .with_writer(std::io::stderr) // 日志输出到 stderr，避免干扰 stdio 协议
         .init();
 
     run_server().await
