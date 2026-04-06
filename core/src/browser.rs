@@ -25,7 +25,7 @@ use crate::snapshot;
 use crate::snapshot::PageSnapshot;
 use crate::types::{
     BrowserConfig, CookieInfo, DownloadOptions, DownloadResult, DownloadStatus, HeadlessMode,
-    KeyModifier, ScreenshotOptions, SetCookieParam, TabInfo,
+    KeyModifier, NavigationWaitUntil, ScreenshotOptions, SetCookieParam, TabInfo,
 };
 
 /// Browser handle.
@@ -269,7 +269,23 @@ impl BrowserEngine {
     /// 如果浏览器未启动会自动启动。
     /// 导航成功后更新活动页面。
     pub async fn navigate(&self, url: &str) -> Result<crate::types::NavigateResult> {
-        info!("Navigating to: {}", url);
+        self.navigate_with_options(url, NavigationWaitUntil::default()).await
+    }
+
+    /// 导航到 URL，带等待策略选项
+    ///
+    /// # 参数
+    ///
+    /// - `url`: 目标 URL
+    /// - `wait_until`: 等待策略（Load / DomContentLoaded / NetworkIdle / None）
+    pub async fn navigate_with_options(
+        &self,
+        url: &str,
+        wait_until: NavigationWaitUntil,
+    ) -> Result<crate::types::NavigateResult> {
+        use chromiumoxide::cdp::browser_protocol::page::EventLifecycleEvent;
+
+        info!("Navigating to: {} (wait_until: {:?})", url, wait_until);
 
         let page = self.get_or_create_page().await?;
 
@@ -277,14 +293,55 @@ impl BrowserEngine {
             .await
             .map_err(|e| Error::Cdp(e.to_string()))?;
 
-        // 等待页面加载
-        tokio::time::timeout(
-            std::time::Duration::from_millis(self.config.navigation_timeout_ms),
-            page.wait_for_navigation(),
-        )
-        .await
-        .map_err(|_| Error::Timeout("Navigation timeout".into()))?
-        .map_err(|e| Error::Cdp(e.to_string()))?;
+        // 根据等待策略等待页面加载
+        let timeout = std::time::Duration::from_millis(self.config.navigation_timeout_ms);
+        match wait_until {
+            NavigationWaitUntil::Load => {
+                // 等待 load 生命周期事件
+                let target_name = "load".to_string();
+                tokio::time::timeout(timeout, async {
+                    let mut stream = page.event_listener::<EventLifecycleEvent>().await
+                        .map_err(|e| Error::Cdp(e.to_string()))?;
+                    use futures::StreamExt;
+                    while let Some(event) = stream.next().await {
+                        if event.name == target_name {
+                            break;
+                        }
+                    }
+                    Ok::<(), Error>(())
+                })
+                .await
+                .map_err(|_| Error::Timeout("Navigation timeout waiting for load".into()))??;
+            }
+            NavigationWaitUntil::DomContentLoaded => {
+                // 等待 DOMContentLoaded 生命周期事件
+                let target_name = "DOMContentLoaded".to_string();
+                tokio::time::timeout(timeout, async {
+                    let mut stream = page.event_listener::<EventLifecycleEvent>().await
+                        .map_err(|e| Error::Cdp(e.to_string()))?;
+                    use futures::StreamExt;
+                    while let Some(event) = stream.next().await {
+                        if event.name == target_name {
+                            break;
+                        }
+                    }
+                    Ok::<(), Error>(())
+                })
+                .await
+                .map_err(|_| Error::Timeout("Navigation timeout waiting for DOMContentLoaded".into()))??;
+            }
+            NavigationWaitUntil::NetworkIdle => {
+                // 先等待基本导航完成，再等待网络空闲
+                tokio::time::timeout(timeout, page.wait_for_navigation())
+                    .await
+                    .map_err(|_| Error::Timeout("Navigation timeout".into()))?
+                    .map_err(|e| Error::Cdp(e.to_string()))?;
+                self.wait_for_network_idle(500, self.config.navigation_timeout_ms).await?;
+            }
+            NavigationWaitUntil::None => {
+                // 不等待任何事件
+            }
+        }
 
         let final_url = page
             .url()
@@ -2311,5 +2368,599 @@ fn key_to_code(key: &str) -> String {
         k if k.starts_with('F') && k.len() <= 3 => k.to_string(),
         k if k.len() == 1 => format!("Key{}", k.to_uppercase()),
         other => other.to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network 监听 / 拦截
+// ---------------------------------------------------------------------------
+
+impl BrowserEngine {
+    /// 启用 Network 域，开始监听网络事件
+    pub async fn enable_network(&self) -> Result<()> {
+        let page = self.active_page().await?;
+        use chromiumoxide::cdp::browser_protocol::network::EnableParams;
+        page.execute(EnableParams::default())
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+        debug!("Network domain enabled");
+        Ok(())
+    }
+
+    /// 监听所有网络请求，收集为 NetworkRequest 列表
+    ///
+    /// 在指定的时间窗口内收集所有网络请求事件。
+    /// # 参数
+    /// - `duration_ms`: 监听持续时间（毫秒）
+    pub async fn listen_network_requests(&self, duration_ms: u64) -> Result<Vec<crate::types::NetworkRequest>> {
+        use chromiumoxide::cdp::browser_protocol::network::EventRequestWillBeSent;
+        use futures::StreamExt;
+
+        let page = self.active_page().await?;
+
+        // 确保启用了 Network 域
+        self.enable_network().await?;
+
+        let mut stream = page.event_listener::<EventRequestWillBeSent>().await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        let mut requests = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(duration_ms);
+
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(event)) => {
+                    let resource_type = event.r#type
+                        .as_ref()
+                        .map(|t| t.as_ref().to_string())
+                        .unwrap_or_default();
+                    requests.push(crate::types::NetworkRequest {
+                        request_id: Into::<String>::into(event.request_id.clone()),
+                        url: event.request.url.clone(),
+                        method: event.request.method.clone(),
+                        resource_type,
+                        headers: event.request.headers.inner().clone(),
+                        post_data: event.request.has_post_data.unwrap_or(false).then_some(String::new()),
+                    });
+                }
+                Ok(None) => break,
+                Err(_) => break, // timeout
+            }
+        }
+
+        info!("Collected {} network requests in {}ms", requests.len(), duration_ms);
+        Ok(requests)
+    }
+
+    /// 监听所有网络响应，收集为 NetworkResponse 列表
+    ///
+    /// # 参数
+    /// - `duration_ms`: 监听持续时间（毫秒）
+    pub async fn listen_network_responses(&self, duration_ms: u64) -> Result<Vec<crate::types::NetworkResponse>> {
+        use chromiumoxide::cdp::browser_protocol::network::EventResponseReceived;
+        use futures::StreamExt;
+
+        let page = self.active_page().await?;
+        self.enable_network().await?;
+
+        let mut stream = page.event_listener::<EventResponseReceived>().await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        let mut responses = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(duration_ms);
+
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(event)) => {
+                    responses.push(crate::types::NetworkResponse {
+                        request_id: Into::<String>::into(event.request_id.clone()),
+                        url: event.response.url.clone(),
+                        status: event.response.status as i32,
+                        status_text: event.response.status_text.clone(),
+                        headers: event.response.headers.inner().clone(),
+                        mime_type: Some(event.response.mime_type.clone()),
+                        blocked: false,
+                    });
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        info!("Collected {} network responses in {}ms", responses.len(), duration_ms);
+        Ok(responses)
+    }
+
+    /// 获取指定请求的响应体
+    ///
+    /// # 参数
+    /// - `request_id`: 请求 ID（从 listen_network_responses 获取）
+    pub async fn get_response_body(&self, request_id: &str) -> Result<String> {
+        use chromiumoxide::cdp::browser_protocol::network::{GetResponseBodyParams, RequestId};
+
+        let page = self.active_page().await?;
+        let params = GetResponseBodyParams::new(RequestId::from(request_id.to_string()));
+        let result = page.execute(params)
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        Ok(result.body.clone())
+    }
+
+    /// 拦截并修改请求（使用 Fetch domain）
+    ///
+    /// 启用请求拦截，匹配 URL 模式的请求将被暂停，可通过回调修改后继续。
+    /// # 参数
+    /// - `url_pattern`: URL 匹配模式（如 "*" 匹配所有请求）
+    /// - `block`: 是否阻止匹配的请求
+    pub async fn intercept_requests(&self, url_pattern: &str, block: bool) -> Result<()> {
+        use chromiumoxide::cdp::browser_protocol::fetch::{
+            EnableParams, RequestPattern, RequestStage,
+        };
+
+        let page = self.active_page().await?;
+        let pattern = RequestPattern {
+            url_pattern: Some(url_pattern.to_string()),
+            resource_type: None,
+            request_stage: Some(RequestStage::Request),
+        };
+
+        page.execute(EnableParams {
+            patterns: Some(vec![pattern]),
+            handle_auth_requests: Some(false),
+        })
+        .await
+        .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        if block {
+            // 监听暂停的请求并阻止它们
+            use chromiumoxide::cdp::browser_protocol::fetch::{EventRequestPaused, FailRequestParams};
+            use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
+            use futures::StreamExt;
+
+            let mut stream = page.event_listener::<EventRequestPaused>().await
+                .map_err(|e| Error::Cdp(e.to_string()))?;
+
+            tokio::spawn(async move {
+                while let Some(event) = stream.next().await {
+                    let request_id = event.request_id.clone();
+                    // 使用 page 的引用来执行 fail 请求 - 简单阻止
+                    let params = FailRequestParams::new(request_id, ErrorReason::Aborted);
+                    let _ = page.execute(params).await;
+                }
+            });
+        }
+
+        info!("Request interception enabled for pattern: {} (block: {})", url_pattern, block);
+        Ok(())
+    }
+
+    /// 禁用请求拦截
+    pub async fn disable_interception(&self) -> Result<()> {
+        use chromiumoxide::cdp::browser_protocol::fetch::DisableParams;
+
+        let page = self.active_page().await?;
+        page.execute(DisableParams::default())
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        info!("Request interception disabled");
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Console 消息监听
+// ---------------------------------------------------------------------------
+
+impl BrowserEngine {
+    /// 启用 Runtime 域并开始监听 Console 消息
+    ///
+    /// 在指定的时间窗口内收集所有 console 输出。
+    /// # 参数
+    /// - `duration_ms`: 监听持续时间（毫秒）
+    pub async fn listen_console(&self, duration_ms: u64) -> Result<Vec<crate::types::ConsoleMessage>> {
+        use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
+        use futures::StreamExt;
+
+        let page = self.active_page().await?;
+
+        // 启用 Runtime 域
+        use chromiumoxide::cdp::js_protocol::runtime::EnableParams;
+        page.execute(EnableParams::default())
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        let mut stream = page.event_listener::<EventConsoleApiCalled>().await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        let mut messages = Vec::new();
+        let deadline = Instant::now() + Duration::from_millis(duration_ms);
+
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(event)) => {
+                    let level = event.r#type.as_ref().to_string();
+                    let text: String = event.args
+                        .iter()
+                        .filter_map(|v| v.value.as_ref())
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()).or_else(|| Some(v.to_string())))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+
+                    messages.push(crate::types::ConsoleMessage {
+                        level,
+                        text,
+                        url: None,
+                        line_number: None,
+                        timestamp: serde_json::to_value(&event.timestamp)
+                            .ok()
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0),
+                    });
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        info!("Collected {} console messages in {}ms", messages.len(), duration_ms);
+        Ok(messages)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 语义化 Locator（getByRole / getByText / getByLabel）
+// ---------------------------------------------------------------------------
+
+impl BrowserEngine {
+    /// 通过 ARIA role 查找元素并点击
+    ///
+    /// 使用 Accessibility 树查找具有指定 role 的元素。
+    /// # 参数
+    /// - `role`: ARIA role（如 "button", "link", "textbox", "checkbox" 等）
+    /// - `name`: 可选的 accessible name 过滤
+    /// - `timeout_ms`: 等待超时
+    pub async fn click_by_role(
+        &self,
+        role: &str,
+        name: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<ActionResult> {
+        let ref_id = self.find_by_role(role, name, timeout_ms).await?;
+        self.click(&ref_id).await
+    }
+
+    /// 通过文本内容查找元素并点击
+    ///
+    /// 在快照中查找包含指定文本的元素。
+    /// # 参数
+    /// - `text`: 要匹配的文本内容
+    /// - `timeout_ms`: 等待超时
+    pub async fn click_by_text(&self, text: &str, timeout_ms: Option<u64>) -> Result<ActionResult> {
+        let ref_id = self.find_by_text(text, timeout_ms).await?;
+        self.click(&ref_id).await
+    }
+
+    /// 通过 label 文本查找元素并点击
+    ///
+    /// 查找具有匹配 label 的表单元素。
+    /// # 参数
+    /// - `label`: label 文本
+    /// - `timeout_ms`: 等待超时
+    pub async fn click_by_label(&self, label: &str, timeout_ms: Option<u64>) -> Result<ActionResult> {
+        let ref_id = self.find_by_label(label, timeout_ms).await?;
+        self.click(&ref_id).await
+    }
+
+    /// 通过 ARIA role 查找元素并输入文本
+    pub async fn type_by_role(
+        &self,
+        role: &str,
+        name: Option<&str>,
+        text: &str,
+        clear_first: bool,
+        timeout_ms: Option<u64>,
+    ) -> Result<ActionResult> {
+        let ref_id = self.find_by_role(role, name, timeout_ms).await?;
+        self.type_text(&ref_id, text, clear_first).await
+    }
+
+    /// 通过 label 查找元素并输入文本
+    pub async fn type_by_label(
+        &self,
+        label: &str,
+        text: &str,
+        clear_first: bool,
+        timeout_ms: Option<u64>,
+    ) -> Result<ActionResult> {
+        let ref_id = self.find_by_label(label, timeout_ms).await?;
+        self.type_text(&ref_id, text, clear_first).await
+    }
+
+    /// 通过 ARIA role 查找元素的 ref_id
+    pub async fn find_by_role(
+        &self,
+        role: &str,
+        name: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<String> {
+        let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
+        let deadline = Instant::now() + Duration::from_millis(timeout);
+
+        loop {
+            let snapshot = self.snapshot().await?;
+            for node in &snapshot.nodes {
+                if node.role == role {
+                    if let Some(n) = name {
+                        if node.name.contains(n) {
+                            return Ok(node.ref_id.clone());
+                        }
+                    } else {
+                        return Ok(node.ref_id.clone());
+                    }
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Err(Error::ElementNotFound(format!(
+                    "No element with role '{}'{} found",
+                    role,
+                    name.map(|n| format!(" and name containing '{}'", n)).unwrap_or_default()
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// 通过文本内容查找元素的 ref_id
+    pub async fn find_by_text(
+        &self,
+        text: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<String> {
+        let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
+        let deadline = Instant::now() + Duration::from_millis(timeout);
+
+        loop {
+            let snapshot = self.snapshot().await?;
+            for node in &snapshot.nodes {
+                if node.name.contains(text) || node.value.as_ref().map_or(false, |v| v.contains(text)) {
+                    // 优先匹配可交互元素
+                    let interactive_roles = ["button", "link", "menuitem", "tab", "option", "radio", "checkbox"];
+                    if interactive_roles.contains(&node.role.as_str()) {
+                        return Ok(node.ref_id.clone());
+                    }
+                }
+            }
+            // 如果没有找到可交互元素，再找任何包含文本的元素
+            for node in &snapshot.nodes {
+                if node.name.contains(text) || node.value.as_ref().map_or(false, |v| v.contains(text)) {
+                    return Ok(node.ref_id.clone());
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Err(Error::ElementNotFound(format!(
+                    "No element with text '{}' found", text
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// 通过 label 查找元素的 ref_id
+    pub async fn find_by_label(
+        &self,
+        label: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<String> {
+        let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
+        let deadline = Instant::now() + Duration::from_millis(timeout);
+
+        loop {
+            let snapshot = self.snapshot().await?;
+            // 先查找 label 元素，然后找它关联的表单元素
+            for node in &snapshot.nodes {
+                if node.role == "label" && node.name.contains(label) {
+                    // label 的子元素通常是它标记的表单元素
+                    if let Some(child) = node.children.first() {
+                        return Ok(child.ref_id.clone());
+                    }
+                }
+                // 也检查具有 label 属性的元素
+                if let Some(labeled_by) = node.attributes.get("labelledby") {
+                    if !labeled_by.is_empty() {
+                        // 查找对应的 label 元素
+                        for label_node in &snapshot.nodes {
+                            if label_node.name.contains(label) {
+                                return Ok(node.ref_id.clone());
+                            }
+                        }
+                    }
+                }
+                // 检查 aria-label 或 title 包含 label 文本
+                if node.attributes.get("aria-label").map_or(false, |v| v.contains(label))
+                    || node.attributes.get("title").map_or(false, |v| v.contains(label))
+                {
+                    return Ok(node.ref_id.clone());
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Err(Error::ElementNotFound(format!(
+                    "No element with label '{}' found", label
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 运行时视口大小调整
+// ---------------------------------------------------------------------------
+
+impl BrowserEngine {
+    /// 设置视口大小
+    ///
+    /// 使用 CDP Emulation.setDeviceMetricsOverride 动态调整视口大小。
+    pub async fn set_viewport_size(&self, width: u32, height: u32) -> Result<()> {
+        use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
+
+        let page = self.active_page().await?;
+        let params = SetDeviceMetricsOverrideParams {
+            width: width as i64,
+            height: height as i64,
+            device_scale_factor: 1.0,
+            mobile: false,
+            scale: None,
+            screen_width: None,
+            screen_height: None,
+            position_x: None,
+            position_y: None,
+            dont_set_visible_size: None,
+            screen_orientation: None,
+            viewport: None,
+        };
+
+        page.execute(params)
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        info!("Viewport set to {}x{}", width, height);
+        Ok(())
+    }
+
+    /// 设置视口大小（带设备缩放因子）
+    pub async fn set_viewport(&self, viewport: &crate::types::ViewportSize) -> Result<()> {
+        use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
+
+        let page = self.active_page().await?;
+        let params = SetDeviceMetricsOverrideParams {
+            width: viewport.width as i64,
+            height: viewport.height as i64,
+            device_scale_factor: viewport.device_scale_factor.unwrap_or(1.0),
+            mobile: false,
+            scale: None,
+            screen_width: None,
+            screen_height: None,
+            position_x: None,
+            position_y: None,
+            dont_set_visible_size: None,
+            screen_orientation: None,
+            viewport: None,
+        };
+
+        page.execute(params)
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        info!("Viewport set to {}x{} (scale: {:?})",
+            viewport.width, viewport.height, viewport.device_scale_factor);
+        Ok(())
+    }
+
+    /// 获取当前视口大小
+    pub async fn get_viewport_size(&self) -> Result<crate::types::ViewportSize> {
+        let page = self.active_page().await?;
+
+        let script = r#"({
+            width: window.innerWidth,
+            height: window.innerHeight,
+            devicePixelRatio: window.devicePixelRatio
+        })"#;
+
+        let result: serde_json::Value = page.evaluate(script)
+            .await
+            .map_err(|e| Error::JavaScript(e.to_string()))?
+            .into_value()
+            .map_err(|e| Error::JavaScript(e.to_string()))?;
+
+        Ok(crate::types::ViewportSize {
+            width: result["width"].as_u64().unwrap_or(1920) as u32,
+            height: result["height"].as_u64().unwrap_or(1080) as u32,
+            device_scale_factor: result["devicePixelRatio"].as_f64(),
+        })
+    }
+
+    /// 模拟移动设备视口
+    pub async fn emulate_device(&self, device_name: &str) -> Result<()> {
+        let (width, height, scale, mobile) = match device_name.to_lowercase().as_str() {
+            "iphone" | "iphone 14" => (390, 844, 3.0, true),
+            "iphone se" => (375, 667, 2.0, true),
+            "ipad" | "ipad pro" => (1024, 1366, 2.0, true),
+            "pixel" | "pixel 7" => (412, 915, 2.625, true),
+            "galaxy" | "galaxy s21" => (360, 800, 3.0, true),
+            _ => return Err(Error::InvalidParameter(format!("Unknown device: {}", device_name))),
+        };
+
+        use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
+        let page = self.active_page().await?;
+        let params = SetDeviceMetricsOverrideParams {
+            width: width as i64,
+            height: height as i64,
+            device_scale_factor: scale,
+            mobile,
+            scale: None,
+            screen_width: None,
+            screen_height: None,
+            position_x: None,
+            position_y: None,
+            dont_set_visible_size: None,
+            screen_orientation: None,
+            viewport: None,
+        };
+
+        page.execute(params)
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        info!("Emulating device: {} ({}x{})", device_name, width, height);
+        Ok(())
+    }
+
+    /// 重置视口为桌面默认值
+    pub async fn reset_viewport(&self) -> Result<()> {
+        self.set_viewport_size(1920, 1080).await
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Drop trait 实现（自动清理浏览器进程）
+// ---------------------------------------------------------------------------
+
+impl Drop for BrowserEngine {
+    fn drop(&mut self) {
+        // 尝试优雅关闭浏览器
+        // 由于 Drop 不能是 async，使用 block_on 来执行清理
+        let browser = self.browser.try_lock().ok().and_then(|mut guard| guard.take());
+        if let Some(browser) = browser {
+            info!("BrowserEngine dropped, cleaning up browser process");
+            // 使用 std::thread 在后台尝试关闭
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build();
+                if let Ok(rt) = rt {
+                    let _ = rt.block_on(async {
+                        // 关闭所有页面
+                        if let Ok(pages) = browser.pages().await {
+                            for page in pages {
+                                let _ = page.close().await;
+                            }
+                        }
+                        // 关闭浏览器
+                        match Arc::try_unwrap(browser) {
+                            Ok(mut b) => { let _ = b.close().await; }
+                            Err(arc) => { info!("Browser has {} remaining references", Arc::strong_count(&arc)); }
+                        }
+                    });
+                }
+            });
+        }
     }
 }

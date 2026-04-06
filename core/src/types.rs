@@ -161,6 +161,23 @@ impl BrowserConfig {
     }
 }
 
+/// Navigation wait strategy.
+///
+/// Controls when `navigate()` considers the navigation complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NavigationWaitUntil {
+    /// Wait for the `load` event (default).
+    #[default]
+    Load,
+    /// Wait for the `DOMContentLoaded` event.
+    DomContentLoaded,
+    /// Wait until there are no network connections for at least 500ms.
+    NetworkIdle,
+    /// Don't wait for any specific event, return immediately after navigation.
+    None,
+}
+
 /// Element bounding box.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bounds {
@@ -276,6 +293,68 @@ pub enum DownloadStatus {
     InProgress,
     Completed,
     Canceled,
+}
+
+/// Network request information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkRequest {
+    /// Request ID.
+    pub request_id: String,
+    /// Request URL.
+    pub url: String,
+    /// HTTP method.
+    pub method: String,
+    /// Resource type (Document, Script, XHR, Fetch, etc.).
+    pub resource_type: String,
+    /// Request headers.
+    pub headers: serde_json::Value,
+    /// POST data (if any).
+    pub post_data: Option<String>,
+}
+
+/// Network response information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkResponse {
+    /// Request ID.
+    pub request_id: String,
+    /// Response URL.
+    pub url: String,
+    /// HTTP status code.
+    pub status: i32,
+    /// HTTP status text.
+    pub status_text: String,
+    /// Response headers.
+    pub headers: serde_json::Value,
+    /// Resource type.
+    pub mime_type: Option<String>,
+    /// Whether the request was blocked.
+    pub blocked: bool,
+}
+
+/// Console message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsoleMessage {
+    /// Console method (log, warn, error, info, etc.).
+    pub level: String,
+    /// Message text.
+    pub text: String,
+    /// URL of the source script.
+    pub url: Option<String>,
+    /// Line number in source.
+    pub line_number: Option<i64>,
+    /// Timestamp.
+    pub timestamp: f64,
+}
+
+/// Viewport size.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewportSize {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+    /// Device scale factor (default 1.0).
+    pub device_scale_factor: Option<f64>,
 }
 
 /// Keyboard modifier keys.

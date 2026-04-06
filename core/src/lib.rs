@@ -125,7 +125,8 @@ pub use browser::{BrowserEngine, BrowserHandle, IframeContext};
 pub use error::{Error, Result};
 pub use snapshot::{PageSnapshot, SnapshotNode};
 pub use types::{
-    Bounds, BrowserConfig, CookieInfo, DownloadOptions, DownloadResult, DownloadStatus,
-    HeadlessMode, KeyModifier, NavigateResult, PageInfo, PressOptions, ScreenshotOptions,
-    ScreenshotResult, SetCookieParam, TabInfo, ToolResult, WaitOptions,
+    Bounds, BrowserConfig, ConsoleMessage, CookieInfo, DownloadOptions, DownloadResult,
+    DownloadStatus, HeadlessMode, KeyModifier, NavigateResult, NavigationWaitUntil,
+    NetworkRequest, NetworkResponse, PageInfo, PressOptions, ScreenshotOptions, ScreenshotResult,
+    SetCookieParam, TabInfo, ToolResult, ViewportSize, WaitOptions,
 };
