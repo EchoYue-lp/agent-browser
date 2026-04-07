@@ -182,6 +182,21 @@ RUST_LOG=agent_browser_mcp=debug,agent_browser_core=debug \
 | `debug` | 详细调试信息 |
 | `trace` | 非常详细的输出 |
 
+### MCP 日志
+
+MCP 服务端支持通过协议配置日志级别：
+
+```json
+{
+  "method": "logging/setLevel",
+  "params": {
+    "level": "debug"
+  }
+}
+```
+
+支持级别: `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`, `emergency`
+
 ## 平台特定说明
 
 ### macOS

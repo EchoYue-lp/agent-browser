@@ -56,6 +56,10 @@ pub enum Error {
     /// Other error.
     #[error("{0}")]
     Other(String),
+
+    /// Path security error.
+    #[error("Invalid path: {0}")]
+    InvalidPath(String),
 }
 
 /// Result type alias.

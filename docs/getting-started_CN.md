@@ -4,7 +4,7 @@
 
 ## 前置要求
 
-- **Rust** 1.75 或更高版本
+- **Rust** 1.85 或更高版本
 - **Chrome** 或 **Chromium** 浏览器（自动检测）
 
 ## 安装
@@ -18,8 +18,8 @@ cargo build --release
 ```
 
 构建产物位于 `target/release/`：
-- `agent-browser-mcp` - MCP Server
-- `agent-browser-http` - HTTP API Server
+- `agent-browser-mcp` - MCP 服务端（STDIO 传输）
+- `agent-browser-http` - HTTP API 服务端
 
 ## 使用方式
 
@@ -27,9 +27,15 @@ cargo build --release
 
 将 Agent Browser 配置为 AI 助手的 MCP 服务器。
 
+Agent Browser 实现 [MCP 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) 规范，包含：
+- 30+ 浏览器自动化工具，带行为注解
+- 截图和快照作为资源访问
+- 预定义提示词用于常见任务
+- 可配置的日志级别
+
 #### Claude Code
 
-编辑 `~/.claude/config.json`：
+编辑 `~/.claude/settings.json`：
 
 ```json
 {
@@ -59,7 +65,7 @@ cargo build --release
 
 对于任何兼容 MCP 的客户端，添加服务器配置：
 - **Command**: `agent-browser-mcp` 二进制文件路径
-- **Protocol**: MCP (stdio transport)
+- **Protocol**: MCP 2025-11-25（STDIO 传输）
 
 配置完成后，你可以让 AI 助手浏览网页：
 
@@ -81,6 +87,7 @@ AI 会自动调用 `browser_navigate` 和 `browser_screenshot` 工具。
 BROWSER_HTTP_PORT=8080 \
 BROWSER_HEADLESS=1 \
 BROWSER_API_KEY=your-secret-key \
+BROWSER_DEFAULT_TIMEOUT_MS=60000 \
 ./target/release/agent-browser-http
 ```
 
@@ -110,7 +117,7 @@ curl "http://localhost:3000/screenshot?full_page=true" | jq -r '.data.image' | b
 
 ```toml
 [dependencies]
-agent-browser-core = "0.1"
+agent-browser-core = "0.2"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 ```

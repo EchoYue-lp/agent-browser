@@ -2,56 +2,176 @@
 
 Complete API documentation for Agent Browser.
 
+## MCP Protocol Support
+
+Agent Browser implements [MCP 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) specification:
+
+- **Protocol Version**: `2025-11-25`
+- **Supported Versions**: `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`
+- Automatic version negotiation with clients
+
+### Server Capabilities
+
+| Capability | Description |
+|------------|-------------|
+| **Tools** | 30+ browser automation tools with annotations |
+| **Resources** | Screenshot and snapshot as resources |
+| **Prompts** | Pre-defined prompts for common tasks |
+| **Logging** | Configurable log levels |
+
 ## MCP Tools
 
-Agent Browser provides 17 MCP tools for AI agents.
+Agent Browser provides 30+ MCP tools for AI agents.
 
-### Navigation
+### Tool Annotations
 
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `browser_navigate` | Navigate to URL | `url` (string), `wait_until` (optional) |
-| `browser_snapshot` | Get Accessibility Tree snapshot | - |
+Each tool includes behavior annotations:
+
+- **`readOnlyHint`**: Tool only reads data, no side effects
+- **`destructiveHint`**: Tool may cause irreversible changes
+- **`idempotentHint`**: Same input always produces same result
+- **`openWorldHint`**: Tool interacts with external systems
+
+### Navigation & Page
+
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `browser_navigate` | Navigate to URL | `openWorldHint: true` |
+| `browser_navigate_with_options` | Navigate with wait strategy | `openWorldHint: true` |
+| `browser_snapshot` | Get Accessibility Tree snapshot | `readOnlyHint: true` |
+| `browser_screenshot` | Take screenshot | `readOnlyHint: true` |
+| `browser_wait` | Wait for selector/timeout | `readOnlyHint: true` |
+| `browser_wait_for_network_idle` | Wait for network idle | `readOnlyHint: true` |
 
 ### Element Actions
 
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `browser_click` | Click element | `ref_id` (string) |
-| `browser_type` | Type text into element | `ref_id`, `text`, `clear_first` (optional) |
-| `browser_press` | Press key | `ref_id`, `key` |
-| `browser_scroll` | Scroll page | `direction`, `amount` |
-| `browser_hover` | Hover over element | `ref_id` |
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `browser_click` | Click element (by ref_id) | `openWorldHint: true` |
+| `browser_type` | Type text into element | `openWorldHint: true` |
+| `browser_press` | Press key on element | `openWorldHint: true` |
+| `browser_press_key` | Press key with modifiers | `openWorldHint: true` |
+| `browser_shortcut` | Send keyboard shortcut | `openWorldHint: true` |
+| `browser_scroll` | Scroll page | `idempotentHint: true` |
+| `browser_upload` | Upload file | `openWorldHint: true` |
 
-### Page Operations
+### Tabs & Frames
 
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `browser_screenshot` | Take screenshot | `full_page` (optional), `selector` (optional) |
-| `browser_wait` | Wait for condition | `selector` (optional), `timeout_ms` (optional) |
-| `browser_evaluate` | Execute JavaScript | `script` |
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `browser_list_tabs` | List all tabs | `readOnlyHint: true` |
+| `browser_activate_tab` | Switch to tab | `idempotentHint: true` |
+| `browser_close_tab` | Close tab | `destructiveHint: true` |
+| `browser_enter_iframe` | Enter iframe context | - |
+| `browser_exit_iframe` | Exit iframe context | `idempotentHint: true` |
+| `browser_exit_all_iframes` | Exit all iframes | `idempotentHint: true` |
 
-### Tab Management
+### Network & Console Monitoring
 
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `browser_list_tabs` | List all tabs | - |
-| `browser_activate_tab` | Switch to tab | `tab_id` |
-| `browser_close_tab` | Close tab | `tab_id` |
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `browser_enable_network_monitoring` | Enable network monitoring | `idempotentHint: true` |
+| `browser_get_network_requests` | Get captured requests | `readOnlyHint: true` |
+| `browser_clear_network_requests` | Clear request records | `idempotentHint: true` |
+| `browser_enable_console_monitoring` | Enable console monitoring | `idempotentHint: true` |
+| `browser_get_console_messages` | Get console messages | `readOnlyHint: true` |
+| `browser_clear_console_messages` | Clear console messages | `idempotentHint: true` |
 
-### Cookies & Storage
+### Downloads & Cookies
 
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `browser_get_cookies` | Get all cookies | - |
-| `browser_set_cookies` | Set cookies | `cookies` (array) |
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `browser_download_file` | Download file from URL | `openWorldHint: true` |
+| `browser_click_and_download` | Click and wait for download | `openWorldHint: true` |
+| `browser_get_cookies` | Get cookies | `readOnlyHint: true` |
+| `browser_set_cookies` | Set cookies | - |
 
-### Advanced
+### Viewport & Advanced
 
-| Tool | Description | Parameters |
-|------|-------------|------------|
-| `browser_upload` | Upload file | `ref_id`, `file_path` |
-| `browser_shutdown` | Close browser | - |
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `browser_evaluate` | Execute JavaScript | `openWorldHint: true` |
+| `browser_set_viewport` | Set viewport size | `idempotentHint: true` |
+| `browser_get_viewport` | Get viewport size | `readOnlyHint: true` |
+| `browser_shutdown` | Close browser | `destructiveHint: true` |
+
+## MCP Resources
+
+Access browser state as MCP resources:
+
+| Resource URI | Description | MIME Type |
+|--------------|-------------|-----------|
+| `resource://browser/screenshot` | Current page screenshot | `image/png` |
+| `resource://browser/snapshot` | Accessibility tree snapshot | `text/plain` |
+
+### Reading Resources
+
+Resources can be accessed via `resources/read`:
+
+```json
+{
+  "method": "resources/read",
+  "params": {
+    "uri": "resource://browser/screenshot"
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "contents": [
+    {
+      "type": "blob",
+      "uri": "resource://browser/screenshot",
+      "mimeType": "image/png",
+      "blob": "base64-encoded-image-data"
+    }
+  ]
+}
+```
+
+## MCP Prompts
+
+Pre-defined prompts for common browser tasks:
+
+| Prompt | Description | Arguments |
+|--------|-------------|-----------|
+| `analyze_page` | Analyze page structure and content | `focus_area` (optional) |
+| `fill_form` | Guide for filling out forms | `form_data` (required) |
+| `extract_data` | Extract structured data from page | `selectors` (optional) |
+
+### Using Prompts
+
+```json
+{
+  "method": "prompts/get",
+  "params": {
+    "name": "fill_form",
+    "arguments": {
+      "form_data": "{\"email\": \"user@example.com\", \"password\": \"secret\"}"
+    }
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "description": "Guide for filling out a web form",
+  "messages": [
+    {
+      "role": "user",
+      "content": {
+        "type": "text",
+        "text": "Fill the following form data: {...}"
+      }
+    }
+  ]
+}
+```
 
 ## HTTP API
 
@@ -215,12 +335,12 @@ Select option in dropdown.
 # Select by value
 curl -X POST http://localhost:3000/select-option \
   -H "Content-Type: application/json" \
-  -d '{"selector": "select#country", "value": "us"}'
+  -d '{"selector': 'select#country', 'value': 'us'}'
 
 # Select by text
 curl -X POST http://localhost:3000/select-option \
   -H "Content-Type: application/json" \
-  -d '{"selector": "select#country", "value": "United States", "by_text": true}'
+  -d '{"selector': 'select#country', 'value': 'United States', 'by_text': true}'
 ```
 
 ##### POST /submenu
@@ -308,6 +428,78 @@ curl -X POST http://localhost:3000/cookies \
   -d '{"cookies": [{"name": "session", "value": "abc123"}]}'
 ```
 
+#### Network Monitoring
+
+##### POST /network/enable
+
+Enable network request monitoring.
+
+```bash
+curl -X POST http://localhost:3000/network/enable
+```
+
+##### GET /network/requests
+
+Get captured network requests.
+
+```bash
+curl http://localhost:3000/network/requests
+```
+
+##### POST /network/clear
+
+Clear network request records.
+
+```bash
+curl -X POST http://localhost:3000/network/clear
+```
+
+#### Console Monitoring
+
+##### POST /console/enable
+
+Enable console message monitoring.
+
+```bash
+curl -X POST http://localhost:3000/console/enable
+```
+
+##### GET /console/messages
+
+Get captured console messages.
+
+```bash
+curl http://localhost:3000/console/messages
+```
+
+##### POST /console/clear
+
+Clear console message records.
+
+```bash
+curl -X POST http://localhost:3000/console/clear
+```
+
+#### Viewport
+
+##### POST /viewport
+
+Set viewport size.
+
+```bash
+curl -X POST http://localhost:3000/viewport \
+  -H "Content-Type: application/json" \
+  -d '{"width": 1920, "height": 1080}'
+```
+
+##### GET /viewport
+
+Get current viewport size.
+
+```bash
+curl http://localhost:3000/viewport
+```
+
 #### Advanced
 
 ##### POST /upload
@@ -381,7 +573,7 @@ curl http://localhost:3000/health
   "status": "ok",
   "data": {
     "status": "ok",
-    "version": "0.1.0"
+    "version": "0.2.0"
   }
 }
 ```

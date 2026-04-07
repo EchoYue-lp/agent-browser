@@ -11,15 +11,14 @@ Agent Browser is designed as a modular system with clear separation of concerns:
 │                    AI Agent (MCP Client)                        │
 │  Claude Code | Cursor | OpenAI | Custom Agents                  │
 └────────────────────────────┬────────────────────────────────────┘
-                             │ MCP Protocol (stdio)
+                             │ MCP 2025-11-25 (stdio)
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                   agent-browser-mcp (MCP Server)                 │
-│  - 17 MCP Tools                                                 │
-│  - JSON-RPC 2.0 Protocol                                        │
-│  - Tool Discovery & Execution                                   │
+│  Tools (30+) | Resources | Prompts | Logging                    │
+│  Protocol: 2025-11-25 | Transports: stdio, sse, http            │
 └────────────────────────────┬────────────────────────────────────┘
-                             │ Internal API
+                             │ Reuses
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                   agent-browser-core (Core Library)              │
@@ -109,30 +108,57 @@ MCP Server implementation for AI agents.
 
 #### Protocol Handler
 
-JSON-RPC 2.0 implementation:
+JSON-RPC 2.0 implementation with MCP 2025-11-25:
 
 ```rust
 fn handle_request(request: Request, state: &ServerState) -> Response
 ```
 
 Methods:
-- `initialize` - Server capabilities
-- `tools/list` - Available tools
+- `initialize` - Server capabilities with version negotiation
+- `tools/list` - Available tools with annotations
 - `tools/call` - Execute tool
+- `resources/list` - Available resources
+- `resources/read` - Read resource content
+- `prompts/list` - Available prompts
+- `prompts/get` - Get prompt messages
+- `logging/setLevel` - Set log level
+
+#### Transport Layer
+
+Modular transport architecture:
+
+| Transport | Status | Description |
+|-----------|--------|-------------|
+| **STDIO** | Production | Standard input/output (default) |
+| **SSE** | Client impl | Server-Sent Events |
+| **HTTP** | Client impl | Streamable HTTP |
 
 #### Tool Definitions
 
-Each tool has:
-- Name and description
-- Input schema (JSON Schema)
-- Handler function
+Each tool has MCP 2025-11-25 compliant structure:
 
 ```rust
 struct Tool {
     name: String,
-    description: String,
+    title: Option<String>,
+    description: Option<String>,
     input_schema: serde_json::Value,
-    handler: fn(Value, &ServerState) -> Result<Value>,
+    output_schema: Option<Value>,
+    annotations: Option<ToolAnnotations>,
+}
+```
+
+#### Tool Annotations
+
+Tools include behavior annotations:
+
+```rust
+struct ToolAnnotations {
+    read_only_hint: Option<bool>,
+    destructive_hint: Option<bool>,
+    idempotent_hint: Option<bool>,
+    open_world_hint: Option<bool>,
 }
 ```
 
@@ -162,6 +188,48 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
 ) -> Response
 ```
+
+## MCP 2025-11-25 Features
+
+### Protocol Version Negotiation
+
+```rust
+pub fn negotiate_version(client_version: &str) -> String {
+    if SUPPORTED_PROTOCOL_VERSIONS.contains(&client_version) {
+        client_version.to_string()
+    } else {
+        MCP_PROTOCOL_VERSION.to_string()  // Fallback to latest
+    }
+}
+```
+
+Supported versions: `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`
+
+### Server Capabilities
+
+```rust
+pub struct ServerCapabilities {
+    pub tools: Option<ToolsCapability>,      // listChanged support
+    pub resources: Option<ResourcesCapability>, // subscribe, listChanged
+    pub prompts: Option<PromptsCapability>,   // listChanged
+    pub logging: Option<LoggingCapability>,
+}
+```
+
+### Resources
+
+| Resource URI | Description | MIME Type |
+|--------------|-------------|-----------|
+| `resource://browser/screenshot` | Current page screenshot | `image/png` |
+| `resource://browser/snapshot` | Accessibility tree snapshot | `text/plain` |
+
+### Prompts
+
+| Prompt | Description | Arguments |
+|--------|-------------|-----------|
+| `analyze_page` | Analyze page structure | `focus_area` (optional) |
+| `fill_form` | Form filling guide | `form_data` (required) |
+| `extract_data` | Data extraction guide | `selectors` (optional) |
 
 ## Design Decisions
 
@@ -194,8 +262,8 @@ Agent Browser provides three interfaces:
 
 1. **MCP (stdio)**: Best for AI agents
    - Zero network overhead
-   - Standard protocol
-   - Tool discovery built-in
+   - Standard protocol with Tools, Resources, Prompts
+   - Tool discovery and annotations built-in
 
 2. **HTTP API**: Best for integration
    - Any HTTP client
@@ -297,17 +365,24 @@ Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 1. Define tool in `tools.rs`:
 
 ```rust
-fn tool_my_action() -> Tool {
-    Tool {
-        name: "browser_my_action".to_string(),
-        description: "Description here".to_string(),
-        input_schema: json!({
+fn tool_my_action() -> ToolDefinition {
+    ToolDefinition {
+        name: "browser_my_action",
+        title: Some("My Action"),
+        description: "Description here",
+        input_schema: || json!({
             "type": "object",
             "properties": {
                 "param": {"type": "string"}
             },
             "required": ["param"]
         }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        },
     }
 }
 ```

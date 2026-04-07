@@ -11,6 +11,8 @@ Practical examples demonstrating Agent Browser capabilities.
 - [Authentication](#authentication)
 - [File Operations](#file-operations)
 - [Multi-Tab Operations](#multi-tab-operations)
+- [Network & Console Monitoring](#network--console-monitoring)
+- [Viewport Settings](#viewport-settings)
 
 ## Web Scraping
 
@@ -176,7 +178,7 @@ curl -X POST http://localhost:3000/hover \
 # Click a Vue component button
 curl -X POST http://localhost:3000/evaluate \
   -H "Content-Type: application/json" \
-  -d '{"script": "document.querySelector(\".el-menu-item:contains(\\\"Settings\\\")\").click()"}'
+  -d '{"script": "Array.from(document.querySelectorAll(\".el-menu-item\")).find(el => el.textContent.includes(\"Settings\")).click()"}'
 
 # Or find by text content
 curl -X POST http://localhost:3000/evaluate \
@@ -313,6 +315,53 @@ for tab in tabs.iter().skip(1) {
 }
 ```
 
+## Network & Console Monitoring
+
+### Network Request Monitoring
+
+```bash
+# Enable network monitoring
+curl -X POST http://localhost:3000/network/enable
+
+# Get captured network requests
+curl http://localhost:3000/network/requests
+
+# Clear request records
+curl -X POST http://localhost:3000/network/clear
+```
+
+### Console Message Monitoring
+
+```bash
+# Enable console monitoring
+curl -X POST http://localhost:3000/console/enable
+
+# Get console messages
+curl http://localhost:3000/console/messages
+
+# Clear message records
+curl -X POST http://localhost:3000/console/clear
+```
+
+## Viewport Settings
+
+### Device Simulation
+
+```bash
+# Set viewport size (desktop)
+curl -X POST http://localhost:3000/viewport \
+  -H "Content-Type: application/json" \
+  -d '{"width": 1920, "height": 1080}'
+
+# Set viewport size (mobile)
+curl -X POST http://localhost:3000/viewport \
+  -H "Content-Type: application/json" \
+  -d '{"width": 375, "height": 667, "device_scale_factor": 2}'
+
+# Get current viewport size
+curl http://localhost:3000/viewport
+```
+
 ## Screenshots
 
 ### Various Screenshot Options
@@ -338,6 +387,46 @@ let screenshot = engine.screenshot(Some(ScreenshotOptions {
 })).await?;
 
 std::fs::write("screenshot.png", base64::decode(&screenshot.data)?)?;
+```
+
+## Keyboard Shortcuts
+
+### Sending Shortcuts
+
+```bash
+# Copy
+curl -X POST http://localhost:3000/shortcut \
+  -H "Content-Type: application/json" \
+  -d '{"shortcut": "copy"}'
+
+# Paste
+curl -X POST http://localhost:3000/shortcut \
+  -H "Content-Type: application/json" \
+  -d '{"shortcut": "paste"}'
+
+# Select all
+curl -X POST http://localhost:3000/shortcut \
+  -H "Content-Type: application/json" \
+  -d '{"shortcut": "selectAll"}'
+
+# Refresh
+curl -X POST http://localhost:3000/shortcut \
+  -H "Content-Type: application/json" \
+  -d '{"shortcut": "refresh"}'
+```
+
+### Keys with Modifiers
+
+```bash
+# Ctrl+C
+curl -X POST http://localhost:3000/press-key \
+  -H "Content-Type: application/json" \
+  -d '{"key": "c", "modifiers": ["control"]}'
+
+# Ctrl+Shift+I (DevTools)
+curl -X POST http://localhost:3000/press-key \
+  -H "Content-Type: application/json" \
+  -d '{"key": "i", "modifiers": ["control", "shift"]}'
 ```
 
 ## Error Handling

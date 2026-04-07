@@ -320,12 +320,19 @@ async fn dispatch_scroll(
 ) -> Result<ActionResult> {
     let n = amount.unwrap_or(300);
     let dir = direction.as_deref().unwrap_or("down");
+
+    // 验证滚动方向
     let (dx, dy) = match dir {
         "up" => (0, -n),
         "down" => (0, n),
         "left" => (-n, 0),
         "right" => (n, 0),
-        _ => (0, n),
+        invalid => {
+            return Err(Error::InvalidParameter(format!(
+                "Invalid scroll direction '{}'. Must be one of: up, down, left, right",
+                invalid
+            )));
+        }
     };
 
     page.evaluate(format!("window.scrollBy({},{});", dx, dy))
@@ -334,7 +341,7 @@ async fn dispatch_scroll(
 
     Ok(ActionResult {
         success: true,
-        message: format!("Scrolled {} by {}", dir, n),
+        message: format!("Scrolled {} by {}px", dir, n),
     })
 }
 

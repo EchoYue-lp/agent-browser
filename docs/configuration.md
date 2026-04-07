@@ -182,6 +182,21 @@ RUST_LOG=agent_browser_mcp=debug,agent_browser_core=debug \
 | `debug` | Detailed debug information |
 | `trace` | Very verbose output |
 
+### MCP Logging
+
+The MCP server supports `logging/setLevel` to configure log levels via the protocol:
+
+```json
+{
+  "method": "logging/setLevel",
+  "params": {
+    "level": "debug"
+  }
+}
+```
+
+Supported levels: `debug`, `info`, `notice`, `warning`, `error`, `critical`, `alert`, `emergency`
+
 ## Platform-Specific Notes
 
 ### macOS

@@ -13,7 +13,7 @@
 ## ✨ Features
 
 - 🤖 **AI-First Design** - Semantic element location via Accessibility Tree, optimized for AI agents
-- 🔌 **Multi-Protocol Support** - MCP Server + HTTP API, compatible with Claude Code, Cursor, OpenAI, etc.
+- 🔌 **MCP 2025-11-25** - Full support for MCP 2025-11-25 specification with Tools, Resources, and Prompts
 - 🚀 **High Performance** - Built with Rust + CDP protocol, low memory footprint, fast response
 - 🛡️ **Anti-Detection** - Supports `--headless=new` and Stealth mode to bypass detection
 - 🎯 **CSS Selector Operations** - Direct element operations using CSS selectors without ref_id
@@ -30,7 +30,7 @@ cargo build --release
 ```
 
 Binaries available at `target/release/`:
-- `agent-browser-mcp` - MCP Server
+- `agent-browser-mcp` - MCP Server (STDIO transport)
 - `agent-browser-http` - HTTP API Server
 
 ### Prerequisites
@@ -44,7 +44,7 @@ Binaries available at `target/release/`:
 
 For MCP clients like Claude Code, Cursor, etc.
 
-**Claude Code Configuration** (`~/.claude/config.json`):
+**Claude Code Configuration** (`~/.claude/settings.json`):
 
 ```json
 {
@@ -110,26 +110,125 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+## 🔌 MCP Protocol Support
+
+Agent Browser implements the [MCP 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) specification:
+
+### Protocol Version
+
+- **Current Version**: `2025-11-25`
+- **Supported Versions**: `2025-11-25`, `2025-06-18`, `2025-03-26`, `2024-11-05`
+- Automatic version negotiation with clients
+
+### Server Capabilities
+
+| Capability | Description |
+|------------|-------------|
+| **Tools** | 30+ browser automation tools with annotations |
+| **Resources** | Screenshot and snapshot as resources |
+| **Prompts** | Pre-defined prompts for common tasks |
+| **Logging** | Configurable log levels |
+
+### Transport
+
+| Transport | Status | Description |
+|-----------|--------|-------------|
+| **STDIO** | ✅ Production | Standard input/output (default) |
+| **SSE** | 🚧 Planned | Server-Sent Events |
+| **HTTP** | 🚧 Planned | Streamable HTTP |
+
 ## 🛠️ MCP Tools
 
-| Tool | Description |
-|------|-------------|
-| `browser_navigate` | Navigate to URL |
-| `browser_snapshot` | Get Accessibility Tree snapshot |
-| `browser_click` | Click element (by ref_id) |
-| `browser_type` | Type text |
-| `browser_press` | Press key |
-| `browser_scroll` | Scroll page |
-| `browser_screenshot` | Take screenshot |
-| `browser_wait` | Wait for selector or timeout |
-| `browser_evaluate` | Execute JavaScript |
-| `browser_get_cookies` | Get cookies |
-| `browser_set_cookies` | Set cookies |
-| `browser_list_tabs` | List tabs |
-| `browser_activate_tab` | Switch tab |
-| `browser_close_tab` | Close tab |
-| `browser_upload` | File upload |
-| `browser_shutdown` | Close browser |
+### Navigation & Page
+
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `browser_navigate` | Navigate to URL | `openWorldHint: true` |
+| `browser_navigate_with_options` | Navigate with wait strategy | `openWorldHint: true` |
+| `browser_snapshot` | Get Accessibility Tree snapshot | `readOnlyHint: true` |
+| `browser_screenshot` | Take screenshot | `readOnlyHint: true` |
+| `browser_wait` | Wait for selector/timeout | `readOnlyHint: true` |
+| `browser_wait_for_network_idle` | Wait for network idle | `readOnlyHint: true` |
+
+### Element Actions
+
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `browser_click` | Click element (by ref_id) | - |
+| `browser_type` | Type text into element | - |
+| `browser_press` | Press key on element | - |
+| `browser_press_key` | Press key with modifiers | - |
+| `browser_shortcut` | Send keyboard shortcut | - |
+| `browser_scroll` | Scroll page | `idempotentHint: true` |
+| `browser_upload` | Upload file | - |
+
+### Tabs & Frames
+
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `browser_list_tabs` | List all tabs | `readOnlyHint: true` |
+| `browser_activate_tab` | Switch to tab | - |
+| `browser_close_tab` | Close tab | `destructiveHint: true` |
+| `browser_enter_iframe` | Enter iframe context | - |
+| `browser_exit_iframe` | Exit iframe context | - |
+| `browser_exit_all_iframes` | Exit all iframes | - |
+
+### Network & Console
+
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `browser_enable_network_monitoring` | Enable network monitoring | - |
+| `browser_get_network_requests` | Get captured requests | `readOnlyHint: true` |
+| `browser_clear_network_requests` | Clear request records | - |
+| `browser_enable_console_monitoring` | Enable console monitoring | - |
+| `browser_get_console_messages` | Get console messages | `readOnlyHint: true` |
+| `browser_clear_console_messages` | Clear console messages | - |
+
+### Downloads & Cookies
+
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `browser_download_file` | Download file from URL | - |
+| `browser_click_and_download` | Click and wait for download | - |
+| `browser_get_cookies` | Get cookies | `readOnlyHint: true` |
+| `browser_set_cookies` | Set cookies | - |
+
+### Advanced
+
+| Tool | Description | Annotations |
+|------|-------------|-------------|
+| `browser_evaluate` | Execute JavaScript | - |
+| `browser_set_viewport` | Set viewport size | - |
+| `browser_get_viewport` | Get viewport size | `readOnlyHint: true` |
+| `browser_shutdown` | Close browser | `destructiveHint: true` |
+
+### Tool Annotations
+
+Tools include annotations describing their behavior:
+
+- **`readOnlyHint`**: Tool only reads data, no side effects
+- **`destructiveHint`**: Tool may cause irreversible changes
+- **`idempotentHint`**: Same input always produces same result
+- **`openWorldHint`**: Tool interacts with external systems
+
+## 📚 MCP Resources
+
+Access browser state as MCP resources:
+
+| Resource URI | Description | MIME Type |
+|--------------|-------------|-----------|
+| `resource://browser/screenshot` | Current page screenshot | `image/png` |
+| `resource://browser/snapshot` | Accessibility tree snapshot | `text/plain` |
+
+## 💬 MCP Prompts
+
+Pre-defined prompts for common browser tasks:
+
+| Prompt | Description | Arguments |
+|--------|-------------|-----------|
+| `analyze_page` | Analyze page structure and content | `focus_area` (optional) |
+| `fill_form` | Guide for filling out forms | `form_data` (required) |
+| `extract_data` | Extract structured data from page | `selectors` (optional) |
 
 ## 🌐 HTTP API Endpoints
 
@@ -207,11 +306,12 @@ let config = BrowserConfig::default()
 │                    AI Agent (MCP Client)                        │
 │  Claude Code | Cursor | OpenAI | Custom Agents                  │
 └────────────────────────────┬────────────────────────────────────┘
-                             │ MCP Protocol (stdio)
+                             │ MCP 2025-11-25 (stdio)
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                   agent-browser-mcp (MCP Server)                 │
-│  17 Tools: navigate, snapshot, click, type, screenshot...       │
+│  Tools (30+) | Resources | Prompts | Logging                    │
+│  Protocol: 2025-11-25 | Transports: stdio, sse, http            │
 └────────────────────────────┬────────────────────────────────────┘
                              │ Reuses
                              ▼
@@ -237,7 +337,7 @@ cargo build --release
 cargo test
 
 # Test MCP server
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' | ./target/release/agent-browser-mcp
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | ./target/release/agent-browser-mcp
 
 # Test HTTP server
 ./target/release/agent-browser-http &

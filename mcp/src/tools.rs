@@ -1,452 +1,603 @@
-//! MCP 工具定义
+//! MCP 工具定义（2025-11-25 规范）
+//!
+//! 包含工具注解（annotations）以描述工具行为
 
 use serde_json::{Value, json};
+
+use crate::protocol::{Tool, ToolAnnotations};
+
+/// 获取所有工具定义
+pub fn get_tool_definitions() -> Vec<Tool> {
+    TOOLS.iter().map(|def| Tool {
+        name: def.name.to_string(),
+        title: def.title.map(|s| s.to_string()),
+        description: Some(def.description.to_string()),
+        input_schema: (def.input_schema)(),
+        output_schema: None,
+        annotations: Some(def.annotations.clone()),
+    }).collect()
+}
 
 /// 工具定义
 pub struct ToolDefinition {
     pub name: &'static str,
+    pub title: Option<&'static str>,
     pub description: &'static str,
     pub input_schema: fn() -> Value,
-}
-
-/// 获取所有工具定义
-pub fn get_tool_definitions() -> Vec<Value> {
-    TOOLS
-        .iter()
-        .map(|tool| {
-            json!({
-                "name": tool.name,
-                "description": tool.description,
-                "inputSchema": (tool.input_schema)()
-            })
-        })
-        .collect()
+    pub annotations: ToolAnnotations,
 }
 
 /// 工具列表
 static TOOLS: &[ToolDefinition] = &[
-    // ── 导航 ────────────────────────────────────────────────
+    // ── 导航 ────────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_navigate",
-        description: "打开浏览器并导航到指定 URL。返回页面信息。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "目标 URL（需包含 http:// 或 https://）"
-                    }
-                },
-                "required": ["url"]
-            })
+        title: Some("Navigate to URL"),
+        description: "Open browser and navigate to the specified URL. Returns page info.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Target URL (must include http:// or https://)"
+                }
+            },
+            "required": ["url"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
         },
     },
-    // ── 快照 ────────────────────────────────────────────────
+    // ── 快照 ────────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_snapshot",
-        description: "获取页面的 Accessibility Tree 快照。返回所有可交互元素的 ref_id、role、name。先调用此方法了解页面结构，再使用其他操作。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {}
-            })
+        title: Some("Get Page Snapshot"),
+        description: "Get Accessibility Tree snapshot of the page. Returns ref_id, role, name for all interactive elements. Call this first to understand page structure.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
-    // ── 点击 ────────────────────────────────────────────────
+    // ── 点击 ────────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_click",
-        description: "点击页面元素。需要先调用 browser_snapshot 获取 ref_id。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref_id": {
-                        "type": "string",
-                        "description": "元素引用 ID（如 'ax1', 'e5'）"
-                    }
-                },
-                "required": ["ref_id"]
-            })
+        title: Some("Click Element"),
+        description: "Click an element on the page. Requires ref_id from browser_snapshot.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "ref_id": {
+                    "type": "string",
+                    "description": "Element reference ID (e.g., 'ax1', 'e5')"
+                }
+            },
+            "required": ["ref_id"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
         },
     },
-    // ── 输入 ────────────────────────────────────────────────
+    // ── 输入 ────────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_type",
-        description: "在输入框中输入文本。需要先调用 browser_snapshot 获取 ref_id。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref_id": {
-                        "type": "string",
-                        "description": "元素引用 ID"
-                    },
-                    "text": {
-                        "type": "string",
-                        "description": "要输入的文本"
-                    },
-                    "clear_first": {
-                        "type": "boolean",
-                        "description": "是否先清空输入框，默认 false"
-                    }
-                },
-                "required": ["ref_id", "text"]
-            })
+        title: Some("Type Text"),
+        description: "Type text into an input field. Requires ref_id from browser_snapshot.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "ref_id": { "type": "string", "description": "Element reference ID" },
+                "text": { "type": "string", "description": "Text to type" },
+                "clear_first": { "type": "boolean", "description": "Clear field first (default: false)" }
+            },
+            "required": ["ref_id", "text"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
         },
     },
-    // ── 按键 ────────────────────────────────────────────────
+    // ── 按键 ────────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_press",
-        description: "在元素上按键（如 Enter、Tab、Escape）。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref_id": {
-                        "type": "string",
-                        "description": "元素引用 ID"
-                    },
-                    "key": {
-                        "type": "string",
-                        "description": "按键名称（如 'Enter', 'Tab', 'Escape', 'ArrowDown'）"
-                    }
-                },
-                "required": ["ref_id", "key"]
-            })
+        title: Some("Press Key"),
+        description: "Press a key on an element (e.g., Enter, Tab, Escape).",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "ref_id": { "type": "string", "description": "Element reference ID" },
+                "key": { "type": "string", "description": "Key name (e.g., 'Enter', 'Tab', 'Escape', 'ArrowDown')" }
+            },
+            "required": ["ref_id", "key"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
         },
     },
-    // ── 滚动 ────────────────────────────────────────────────
+    // ── 滚动 ────────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_scroll",
-        description: "滚动页面。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "direction": {
-                        "type": "string",
-                        "enum": ["up", "down", "left", "right"],
-                        "description": "滚动方向，默认 down"
-                    },
-                    "amount": {
-                        "type": "integer",
-                        "description": "滚动像素数，默认 300"
-                    }
-                }
-            })
+        title: Some("Scroll Page"),
+        description: "Scroll the page in a direction.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "direction": { "type": "string", "enum": ["up", "down", "left", "right"], "description": "Direction (default: down)" },
+                "amount": { "type": "integer", "description": "Pixels to scroll (default: 300)" }
+            }
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
-    // ── 截图 ────────────────────────────────────────────────
+    // ── 截图 ────────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_screenshot",
-        description: "截取当前页面的截图。支持全页面和指定元素截图。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "full_page": {
-                        "type": "boolean",
-                        "description": "是否截取整个页面，默认 false"
-                    },
-                    "selector": {
-                        "type": "string",
-                        "description": "CSS 选择器，仅截取该元素"
-                    }
-                }
-            })
+        title: Some("Take Screenshot"),
+        description: "Take a screenshot of the current page. Supports full page and element screenshots.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "full_page": { "type": "boolean", "description": "Capture full page (default: false)" },
+                "selector": { "type": "string", "description": "CSS selector to capture specific element" }
+            }
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
-    // ── 等待 ────────────────────────────────────────────────
+    // ── 等待 ────────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_wait",
-        description: "等待指定时间或等待选择器出现。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "timeout_ms": {
-                        "type": "integer",
-                        "description": "等待时间（毫秒），默认 1000"
-                    },
-                    "selector": {
-                        "type": "string",
-                        "description": "等待该 CSS 选择器出现"
-                    }
-                }
-            })
+        title: Some("Wait"),
+        description: "Wait for a specified time or for a selector to appear.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default: 1000)" },
+                "selector": { "type": "string", "description": "CSS selector to wait for" }
+            }
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
-    // ── 执行 JS ────────────────────────────────────────────────
+    // ── 执行 JS ──────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_evaluate",
-        description: "在页面中执行 JavaScript 代码。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "script": {
-                        "type": "string",
-                        "description": "JavaScript 代码"
-                    }
-                },
-                "required": ["script"]
-            })
+        title: Some("Execute JavaScript"),
+        description: "Execute JavaScript code on the page.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "script": { "type": "string", "description": "JavaScript code" }
+            },
+            "required": ["script"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
         },
     },
-    // ── Cookie 管理 ────────────────────────────────────────────────
+    // ── Cookie 管理 ──────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_get_cookies",
-        description: "获取当前页面的所有 Cookie。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {}
-            })
+        title: Some("Get Cookies"),
+        description: "Get all cookies for the current page.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
     ToolDefinition {
         name: "browser_set_cookies",
-        description: "为当前页面设置 Cookie。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "cookies": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "name": {"type": "string"},
-                                "value": {"type": "string"},
-                                "domain": {"type": "string"},
-                                "path": {"type": "string"}
-                            },
-                            "required": ["name", "value"]
-                        }
+        title: Some("Set Cookies"),
+        description: "Set cookies for the current page.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "cookies": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "value": { "type": "string" },
+                            "domain": { "type": "string" },
+                            "path": { "type": "string" }
+                        },
+                        "required": ["name", "value"]
                     }
-                },
-                "required": ["cookies"]
-            })
+                }
+            },
+            "required": ["cookies"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(false),
         },
     },
-    // ── 标签页管理 ────────────────────────────────────────────────
+    // ── 标签页管理 ──────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_list_tabs",
-        description: "列出所有打开的浏览器标签页。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {}
-            })
+        title: Some("List Tabs"),
+        description: "List all open browser tabs.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
     ToolDefinition {
         name: "browser_activate_tab",
-        description: "切换到指定标签页。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "tab_id": {
-                        "type": "string",
-                        "description": "要激活的标签页 ID"
-                    }
-                },
-                "required": ["tab_id"]
-            })
+        title: Some("Activate Tab"),
+        description: "Switch to a specific tab.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string", "description": "Tab ID to activate" }
+            },
+            "required": ["tab_id"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
     ToolDefinition {
         name: "browser_close_tab",
-        description: "关闭指定标签页。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "tab_id": {
-                        "type": "string",
-                        "description": "要关闭的标签页 ID"
-                    }
-                },
-                "required": ["tab_id"]
-            })
+        title: Some("Close Tab"),
+        description: "Close a specific tab.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "tab_id": { "type": "string", "description": "Tab ID to close" }
+            },
+            "required": ["tab_id"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
-    // ── 文件上传 ────────────────────────────────────────────────
+    // ── 文件上传 ────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_upload",
-        description: "上传文件到文件输入框。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref_id": {
-                        "type": "string",
-                        "description": "文件输入框的元素引用 ID"
-                    },
-                    "file_path": {
-                        "type": "string",
-                        "description": "本地文件的绝对路径"
-                    }
-                },
-                "required": ["ref_id", "file_path"]
-            })
+        title: Some("Upload File"),
+        description: "Upload a file to a file input element.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "ref_id": { "type": "string", "description": "File input element reference ID" },
+                "file_path": { "type": "string", "description": "Absolute path to local file" }
+            },
+            "required": ["ref_id", "file_path"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
         },
     },
-    // ── 网络空闲 ────────────────────────────────────────────────
+    // ── 网络空闲 ────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_wait_for_network_idle",
-        description: "等待网络请求完成（SPA 页面加载完成后使用）。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "idle_ms": {
-                        "type": "integer",
-                        "description": "空闲判定时间（毫秒），默认 500"
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "description": "最大等待时间（毫秒），默认 30000"
-                    }
-                }
-            })
+        title: Some("Wait for Network Idle"),
+        description: "Wait for network requests to complete (use after SPA page load).",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "idle_ms": { "type": "integer", "description": "Idle threshold in ms (default: 500)" },
+                "timeout_ms": { "type": "integer", "description": "Max wait time in ms (default: 30000)" }
+            }
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
-    // ── 关闭 ────────────────────────────────────────────────
+    // ── 关闭 ────────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_shutdown",
-        description: "关闭浏览器。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {}
-            })
+        title: Some("Shutdown Browser"),
+        description: "Close the browser.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(true),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
-    // ── iframe 上下文 ────────────────────────────────────────────────
+    // ── iframe 上下文 ───────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_enter_iframe",
-        description: "进入指定的 iframe 上下文。后续操作将在该 iframe 内执行。支持嵌套 iframe。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref_id": {
-                        "type": "string",
-                        "description": "iframe 元素的引用 ID（如 'iframe1'）"
-                    }
-                },
-                "required": ["ref_id"]
-            })
+        title: Some("Enter Iframe"),
+        description: "Enter an iframe context. Subsequent operations will execute inside the iframe.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "ref_id": { "type": "string", "description": "Iframe element reference ID" }
+            },
+            "required": ["ref_id"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(false),
         },
     },
     ToolDefinition {
         name: "browser_exit_iframe",
-        description: "退出当前 iframe 上下文，返回到父级上下文。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {}
-            })
+        title: Some("Exit Iframe"),
+        description: "Exit current iframe context, return to parent context.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
     ToolDefinition {
         name: "browser_exit_all_iframes",
-        description: "退出所有 iframe 上下文，返回到主文档。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {}
-            })
+        title: Some("Exit All Iframes"),
+        description: "Exit all iframe contexts, return to main document.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
-    // ── 文件下载 ────────────────────────────────────────────────
+    // ── 文件下载 ────────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_download_file",
-        description: "下载指定 URL 的文件。返回下载结果，包括文件路径。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "要下载的文件 URL"
-                    },
-                    "save_path": {
-                        "type": "string",
-                        "description": "保存目录（可选，默认临时目录）"
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "description": "下载超时时间（毫秒，默认 60000）"
-                    }
-                },
-                "required": ["url"]
-            })
+        title: Some("Download File"),
+        description: "Download a file from URL.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "URL of file to download" },
+                "save_path": { "type": "string", "description": "Save directory (optional)" },
+                "timeout_ms": { "type": "integer", "description": "Download timeout (default: 60000)" }
+            },
+            "required": ["url"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
         },
     },
     ToolDefinition {
         name: "browser_click_and_download",
-        description: "点击元素并等待下载完成。用于点击下载按钮场景。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "ref_id": {
-                        "type": "string",
-                        "description": "要点击的元素引用 ID"
-                    },
-                    "save_path": {
-                        "type": "string",
-                        "description": "保存目录（可选，默认临时目录）"
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "description": "下载超时时间（毫秒，默认 60000）"
-                    }
-                },
-                "required": ["ref_id"]
-            })
+        title: Some("Click and Download"),
+        description: "Click an element and wait for download to complete.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "ref_id": { "type": "string", "description": "Element to click" },
+                "save_path": { "type": "string", "description": "Save directory (optional)" },
+                "timeout_ms": { "type": "integer", "description": "Download timeout (default: 60000)" }
+            },
+            "required": ["ref_id"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
         },
     },
-    // ── 键盘快捷键 ────────────────────────────────────────────────
+    // ── 键盘快捷键 ──────────────────────────────────────────────────────────
     ToolDefinition {
         name: "browser_press_key",
-        description: "按键（支持修饰键组合）。可执行 Ctrl+C、Cmd+S 等快捷键。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "key": {
-                        "type": "string",
-                        "description": "按键（如 'c', 'Enter', 'F5'）"
-                    },
-                    "modifiers": {
-                        "type": "array",
-                        "items": { "type": "string", "enum": ["alt", "control", "meta", "shift"] },
-                        "description": "修饰键列表（如 ['control'] 表示 Ctrl）"
-                    }
-                },
-                "required": ["key"]
-            })
+        title: Some("Press Key with Modifiers"),
+        description: "Press a key with optional modifiers (Ctrl, Alt, Shift, Cmd).",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "key": { "type": "string", "description": "Key (e.g., 'c', 'Enter', 'F5')" },
+                "modifiers": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": ["alt", "control", "meta", "shift"] },
+                    "description": "Modifier keys"
+                }
+            },
+            "required": ["key"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
         },
     },
     ToolDefinition {
         name: "browser_shortcut",
-        description: "发送预设快捷键。支持：copy, paste, cut, save, selectAll, undo, redo, find, refresh, devTools, print, newTab, closeTab。",
-        input_schema: || {
-            json!({
-                "type": "object",
-                "properties": {
-                    "shortcut": {
-                        "type": "string",
-                        "description": "快捷键名称（如 'copy', 'save', 'undo'）"
-                    }
-                },
-                "required": ["shortcut"]
-            })
+        title: Some("Send Shortcut"),
+        description: "Send a predefined keyboard shortcut (copy, paste, save, undo, etc.).",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "shortcut": { "type": "string", "description": "Shortcut name (copy, paste, cut, save, selectAll, undo, redo, find, refresh, devTools, print, newTab, closeTab)" }
+            },
+            "required": ["shortcut"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        },
+    },
+    // ── 高级导航 ────────────────────────────────────────────────────────────
+    ToolDefinition {
+        name: "browser_navigate_with_options",
+        title: Some("Navigate with Options"),
+        description: "Navigate with custom wait strategy (load, domContentLoaded, networkIdle, none).",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "url": { "type": "string", "description": "Target URL" },
+                "wait_until": { "type": "string", "enum": ["load", "domContentLoaded", "networkIdle", "none"], "description": "Wait strategy" }
+            },
+            "required": ["url"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        },
+    },
+    // ── 网络监控 ────────────────────────────────────────────────────────────
+    ToolDefinition {
+        name: "browser_enable_network_monitoring",
+        title: Some("Enable Network Monitoring"),
+        description: "Enable network request monitoring.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    },
+    ToolDefinition {
+        name: "browser_get_network_requests",
+        title: Some("Get Network Requests"),
+        description: "Get captured network requests (requires monitoring enabled).",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    },
+    ToolDefinition {
+        name: "browser_clear_network_requests",
+        title: Some("Clear Network Requests"),
+        description: "Clear captured network request records.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    },
+    // ── 控制台监控 ──────────────────────────────────────────────────────────
+    ToolDefinition {
+        name: "browser_enable_console_monitoring",
+        title: Some("Enable Console Monitoring"),
+        description: "Enable console message monitoring.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    },
+    ToolDefinition {
+        name: "browser_get_console_messages",
+        title: Some("Get Console Messages"),
+        description: "Get captured console messages (requires monitoring enabled).",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    },
+    ToolDefinition {
+        name: "browser_clear_console_messages",
+        title: Some("Clear Console Messages"),
+        description: "Clear captured console message records.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    },
+    // ── 视口设置 ────────────────────────────────────────────────────────────
+    ToolDefinition {
+        name: "browser_set_viewport",
+        title: Some("Set Viewport"),
+        description: "Set browser viewport size for device simulation.",
+        input_schema: || json!({
+            "type": "object",
+            "properties": {
+                "width": { "type": "integer", "description": "Viewport width in pixels" },
+                "height": { "type": "integer", "description": "Viewport height in pixels" },
+                "device_scale_factor": { "type": "number", "description": "Device pixel ratio (optional)" }
+            },
+            "required": ["width", "height"]
+        }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    },
+    ToolDefinition {
+        name: "browser_get_viewport",
+        title: Some("Get Viewport"),
+        description: "Get current browser viewport size.",
+        input_schema: || json!({ "type": "object", "properties": {} }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
         },
     },
 ];

@@ -2,56 +2,176 @@
 
 Agent Browser 完整的 API 文档。
 
-## MCP 工具列表
+## MCP 协议支持
 
-Agent Browser 为 AI Agent 提供 17 个 MCP 工具。
+Agent Browser 实现 [MCP 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) 规范：
 
-### 导航
+- **协议版本**: `2025-11-25`
+- **支持版本**: `2025-11-25`、`2025-06-18`、`2025-03-26`、`2024-11-05`
+- 自动与客户端进行版本协商
 
-| 工具 | 描述 | 参数 |
+### 服务端能力
+
+| 能力 | 描述 |
+|------|------|
+| **Tools** | 30+ 浏览器自动化工具，带行为注解 |
+| **Resources** | 截图和快照作为资源访问 |
+| **Prompts** | 预定义提示词用于常见任务 |
+| **Logging** | 可配置的日志级别 |
+
+## MCP 工具
+
+Agent Browser 为 AI Agent 提供 30+ MCP 工具。
+
+### 工具注解
+
+每个工具包含行为注解：
+
+- **`readOnlyHint`**: 工具只读数据，无副作用
+- **`destructiveHint`**: 工具可能导致不可逆变更
+- **`idempotentHint`**: 相同输入始终产生相同结果
+- **`openWorldHint`**: 工具与外部系统交互
+
+### 导航与页面
+
+| 工具 | 描述 | 注解 |
 |------|------|------|
-| `browser_navigate` | 导航到 URL | `url` (字符串), `wait_until` (可选) |
-| `browser_snapshot` | 获取 Accessibility Tree 快照 | - |
+| `browser_navigate` | 导航到 URL | `openWorldHint: true` |
+| `browser_navigate_with_options` | 带等待策略导航 | `openWorldHint: true` |
+| `browser_snapshot` | 获取 Accessibility Tree 快照 | `readOnlyHint: true` |
+| `browser_screenshot` | 截图 | `readOnlyHint: true` |
+| `browser_wait` | 等待选择器/超时 | `readOnlyHint: true` |
+| `browser_wait_for_network_idle` | 等待网络空闲 | `readOnlyHint: true` |
 
 ### 元素操作
 
-| 工具 | 描述 | 参数 |
+| 工具 | 描述 | 注解 |
 |------|------|------|
-| `browser_click` | 点击元素 | `ref_id` (字符串) |
-| `browser_type` | 输入文本 | `ref_id`, `text`, `clear_first` (可选) |
-| `browser_press` | 按键 | `ref_id`, `key` |
-| `browser_scroll` | 滚动页面 | `direction`, `amount` |
-| `browser_hover` | 鼠标悬停 | `ref_id` |
+| `browser_click` | 点击元素（by ref_id） | `openWorldHint: true` |
+| `browser_type` | 输入文本 | `openWorldHint: true` |
+| `browser_press` | 按键 | `openWorldHint: true` |
+| `browser_press_key` | 带修饰键按键 | `openWorldHint: true` |
+| `browser_shortcut` | 发送快捷键 | `openWorldHint: true` |
+| `browser_scroll` | 滚动页面 | `idempotentHint: true` |
+| `browser_upload` | 文件上传 | `openWorldHint: true` |
 
-### 页面操作
+### 标签页与框架
 
-| 工具 | 描述 | 参数 |
+| 工具 | 描述 | 注解 |
 |------|------|------|
-| `browser_screenshot` | 截图 | `full_page` (可选), `selector` (可选) |
-| `browser_wait` | 等待条件 | `selector` (可选), `timeout_ms` (可选) |
-| `browser_evaluate` | 执行 JavaScript | `script` |
+| `browser_list_tabs` | 列出所有标签页 | `readOnlyHint: true` |
+| `browser_activate_tab` | 切换标签页 | `idempotentHint: true` |
+| `browser_close_tab` | 关闭标签页 | `destructiveHint: true` |
+| `browser_enter_iframe` | 进入 iframe | - |
+| `browser_exit_iframe` | 退出 iframe | `idempotentHint: true` |
+| `browser_exit_all_iframes` | 退出所有 iframe | `idempotentHint: true` |
 
-### 标签页管理
+### 网络与控制台监控
 
-| 工具 | 描述 | 参数 |
+| 工具 | 描述 | 注解 |
 |------|------|------|
-| `browser_list_tabs` | 列出所有标签页 | - |
-| `browser_activate_tab` | 切换标签页 | `tab_id` |
-| `browser_close_tab` | 关闭标签页 | `tab_id` |
+| `browser_enable_network_monitoring` | 启用网络监控 | `idempotentHint: true` |
+| `browser_get_network_requests` | 获取网络请求 | `readOnlyHint: true` |
+| `browser_clear_network_requests` | 清除请求记录 | `idempotentHint: true` |
+| `browser_enable_console_monitoring` | 启用控制台监控 | `idempotentHint: true` |
+| `browser_get_console_messages` | 获取控制台消息 | `readOnlyHint: true` |
+| `browser_clear_console_messages` | 清除控制台消息 | `idempotentHint: true` |
 
-### Cookie 管理
+### 下载与 Cookie
 
-| 工具 | 描述 | 参数 |
+| 工具 | 描述 | 注解 |
 |------|------|------|
-| `browser_get_cookies` | 获取所有 Cookie | - |
-| `browser_set_cookies` | 设置 Cookie | `cookies` (数组) |
+| `browser_download_file` | 从 URL 下载文件 | `openWorldHint: true` |
+| `browser_click_and_download` | 点击并下载 | `openWorldHint: true` |
+| `browser_get_cookies` | 获取 Cookie | `readOnlyHint: true` |
+| `browser_set_cookies` | 设置 Cookie | - |
 
-### 高级功能
+### 视口与高级功能
 
-| 工具 | 描述 | 参数 |
+| 工具 | 描述 | 注解 |
 |------|------|------|
-| `browser_upload` | 上传文件 | `ref_id`, `file_path` |
-| `browser_shutdown` | 关闭浏览器 | - |
+| `browser_evaluate` | 执行 JavaScript | `openWorldHint: true` |
+| `browser_set_viewport` | 设置视口大小 | `idempotentHint: true` |
+| `browser_get_viewport` | 获取视口大小 | `readOnlyHint: true` |
+| `browser_shutdown` | 关闭浏览器 | `destructiveHint: true` |
+
+## MCP 资源
+
+以 MCP 资源方式访问浏览器状态：
+
+| 资源 URI | 描述 | MIME 类型 |
+|----------|------|-----------|
+| `resource://browser/screenshot` | 当前页面截图 | `image/png` |
+| `resource://browser/snapshot` | Accessibility Tree 快照 | `text/plain` |
+
+### 读取资源
+
+通过 `resources/read` 访问资源：
+
+```json
+{
+  "method": "resources/read",
+  "params": {
+    "uri": "resource://browser/screenshot"
+  }
+}
+```
+
+**响应：**
+
+```json
+{
+  "contents": [
+    {
+      "type": "blob",
+      "uri": "resource://browser/screenshot",
+      "mimeType": "image/png",
+      "blob": "base64编码的图像数据"
+    }
+  ]
+}
+```
+
+## MCP 提示词
+
+预定义的浏览器任务提示词：
+
+| 提示词 | 描述 | 参数 |
+|--------|------|------|
+| `analyze_page` | 分析页面结构和内容 | `focus_area`（可选） |
+| `fill_form` | 填写表单指南 | `form_data`（必填） |
+| `extract_data` | 从页面提取结构化数据 | `selectors`（可选） |
+
+### 使用提示词
+
+```json
+{
+  "method": "prompts/get",
+  "params": {
+    "name": "fill_form",
+    "arguments": {
+      "form_data": "{\"email\": \"user@example.com\", \"password\": \"secret\"}"
+    }
+  }
+}
+```
+
+**响应：**
+
+```json
+{
+  "description": "填写网页表单的指南",
+  "messages": [
+    {
+      "role": "user",
+      "content": {
+        "type": "text",
+        "text": "填写以下表单数据: {...}"
+      }
+    }
+  ]
+}
+```
 
 ## HTTP API
 
@@ -308,6 +428,78 @@ curl -X POST http://localhost:3000/cookies \
   -d '{"cookies": [{"name": "session", "value": "abc123"}]}'
 ```
 
+#### 网络监控
+
+##### POST /network/enable
+
+启用网络请求监控。
+
+```bash
+curl -X POST http://localhost:3000/network/enable
+```
+
+##### GET /network/requests
+
+获取捕获的网络请求。
+
+```bash
+curl http://localhost:3000/network/requests
+```
+
+##### POST /network/clear
+
+清除网络请求记录。
+
+```bash
+curl -X POST http://localhost:3000/network/clear
+```
+
+#### 控制台监控
+
+##### POST /console/enable
+
+启用控制台消息监控。
+
+```bash
+curl -X POST http://localhost:3000/console/enable
+```
+
+##### GET /console/messages
+
+获取捕获的控制台消息。
+
+```bash
+curl http://localhost:3000/console/messages
+```
+
+##### POST /console/clear
+
+清除控制台消息记录。
+
+```bash
+curl -X POST http://localhost:3000/console/clear
+```
+
+#### 视口
+
+##### POST /viewport
+
+设置视口大小。
+
+```bash
+curl -X POST http://localhost:3000/viewport \
+  -H "Content-Type: application/json" \
+  -d '{"width": 1920, "height": 1080}'
+```
+
+##### GET /viewport
+
+获取当前视口大小。
+
+```bash
+curl http://localhost:3000/viewport
+```
+
 #### 高级功能
 
 ##### POST /upload
@@ -381,7 +573,7 @@ curl http://localhost:3000/health
   "status": "ok",
   "data": {
     "status": "ok",
-    "version": "0.1.0"
+    "version": "0.2.0"
   }
 }
 ```

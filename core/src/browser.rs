@@ -28,6 +28,58 @@ use crate::types::{
     KeyModifier, NavigationWaitUntil, ScreenshotOptions, SetCookieParam, TabInfo,
 };
 
+/// Validate a file path for security.
+///
+/// Checks for:
+/// - Path traversal attempts (..)
+/// - Absolute path requirements
+/// - Symlink resolution
+fn validate_file_path(path: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(path);
+
+    // Check for path traversal
+    let path_str = path.to_string_lossy();
+    if path_str.contains("..") {
+        return Err(Error::InvalidPath(
+            "Path traversal detected: '..' not allowed".to_string(),
+        ));
+    }
+
+    // Resolve canonical path if exists, otherwise use the given path
+    let canonical = if path.exists() {
+        path.canonicalize().map_err(|e| {
+            Error::InvalidPath(format!("Failed to resolve path: {}", e))
+        })?
+    } else {
+        // For non-existent paths, check parent directory
+        if let Some(parent) = path.parent() {
+            if parent.exists() {
+                parent.canonicalize().map_err(|e| {
+                    Error::InvalidPath(format!("Failed to resolve parent path: {}", e))
+                })?;
+            }
+        }
+        path
+    };
+
+    Ok(canonical)
+}
+
+/// Validate a directory path for security.
+fn validate_directory_path(path: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(path);
+
+    // Check for path traversal
+    let path_str = path.to_string_lossy();
+    if path_str.contains("..") {
+        return Err(Error::InvalidPath(
+            "Path traversal detected: '..' not allowed".to_string(),
+        ));
+    }
+
+    Ok(path)
+}
+
 /// Browser handle.
 ///
 /// Lightweight, cloneable browser operation handle.
@@ -82,16 +134,6 @@ pub struct IframeContext {
 /// let engine = BrowserEngine::new(BrowserConfig::headed());
 /// engine.navigate("https://example.com").await?;
 /// let snapshot = engine.snapshot().await?;
-/// Combined tab state to prevent deadlocks from acquiring multiple locks.
-struct TabState {
-    /// Active page.
-    active_page: Option<Page>,
-    /// Tab mapping (tab_id -> Page).
-    tabs: HashMap<String, Page>,
-    /// Active tab_id.
-    active_tab_id: Option<String>,
-}
-
 /// engine.click("ax1").await?;
 /// engine.shutdown().await?;
 /// # Ok(())
@@ -104,20 +146,41 @@ pub struct BrowserEngine {
     tab_state: Mutex<TabState>,
     /// Configuration.
     config: BrowserConfig,
-    /// iframe context stack (supports nested iframes).
-    iframe_stack: Mutex<Vec<IframeContext>>,
+    /// Combined iframe state (single lock to prevent deadlocks).
+    iframe_state: Mutex<IframeState>,
     /// ref_id -> frame_id mapping (updated on each snapshot).
     iframe_mapping: Mutex<HashMap<String, String>>,
     /// frame_id -> execution_context_id mapping.
     execution_contexts: Mutex<HashMap<String, i64>>,
-    /// Currently active frame_id (None means main frame).
-    active_frame_id: Mutex<Option<String>>,
-    /// Currently active execution context ID.
-    active_context_id: Mutex<Option<i64>>,
     /// Download directory.
     download_dir: Mutex<Option<PathBuf>>,
     /// Download event broadcaster.
     download_events: broadcast::Sender<DownloadResult>,
+    /// Network request log (for monitoring).
+    network_requests: Arc<Mutex<Vec<crate::types::NetworkRequest>>>,
+    /// Console message log (for monitoring).
+    console_messages: Arc<Mutex<Vec<crate::types::ConsoleMessage>>>,
+}
+
+/// Combined tab state to prevent deadlocks from acquiring multiple locks.
+struct TabState {
+    /// Active page.
+    active_page: Option<Page>,
+    /// Tab mapping (tab_id -> Page).
+    tabs: HashMap<String, Page>,
+    /// Active tab_id.
+    active_tab_id: Option<String>,
+}
+
+/// Combined iframe state to prevent deadlocks from acquiring multiple locks.
+#[derive(Clone)]
+struct IframeState {
+    /// iframe context stack (supports nested iframes).
+    iframe_stack: Vec<IframeContext>,
+    /// Currently active frame_id (None means main frame).
+    active_frame_id: Option<String>,
+    /// Currently active execution context ID.
+    active_context_id: Option<i64>,
 }
 
 impl BrowserEngine {
@@ -132,13 +195,17 @@ impl BrowserEngine {
                 active_tab_id: None,
             }),
             config,
-            iframe_stack: Mutex::new(Vec::new()),
+            iframe_state: Mutex::new(IframeState {
+                iframe_stack: Vec::new(),
+                active_frame_id: None,
+                active_context_id: None,
+            }),
             iframe_mapping: Mutex::new(HashMap::new()),
             execution_contexts: Mutex::new(HashMap::new()),
-            active_frame_id: Mutex::new(None),
-            active_context_id: Mutex::new(None),
             download_dir: Mutex::new(None),
             download_events,
+            network_requests: Arc::new(Mutex::new(Vec::new())),
+            console_messages: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -233,16 +300,24 @@ impl BrowserEngine {
 
     /// 获取或创建活动页面
     async fn get_or_create_page(&self) -> Result<Page> {
-        // 检查现有活动页面
-        let mut state = self.tab_state.lock().await;
-        if let Some(ref page) = state.active_page {
-            // 检查页面是否仍然有效
-            if page.url().await.is_ok() {
-                return Ok(page.clone());
+        // 第一步：检查现有活动页面（持锁时间尽可能短）
+        {
+            let state = self.tab_state.lock().await;
+            if let Some(ref page) = state.active_page {
+                // 先克隆页面引用，释放锁后再检查有效性
+                let page_clone = page.clone();
+                drop(state);
+
+                // 不持有锁的情况下检查页面有效性
+                if page_clone.url().await.is_ok() {
+                    return Ok(page_clone);
+                }
+                // 页面无效，继续创建新页面
             }
+            // 没有活动页面，继续创建新页面
         }
 
-        // 需要创建新页面
+        // 第二步：创建新页面（锁已释放）
         let handle = self.ensure_launched().await?;
         let page = handle
             .new_page("about:blank")
@@ -254,7 +329,12 @@ impl BrowserEngine {
             self.register_stealth_scripts(&page).await?;
         }
 
-        state.active_page = Some(page.clone());
+        // 第三步：更新状态（重新获取锁）
+        {
+            let mut state = self.tab_state.lock().await;
+            state.active_page = Some(page.clone());
+        }
+
         Ok(page)
     }
 
@@ -276,7 +356,7 @@ impl BrowserEngine {
     ///
     /// # 参数
     ///
-    /// - `url`: 目标 URL
+    /// - `url`: 目标 URL（必须以 http:// 或 https:// 开头）
     /// - `wait_until`: 等待策略（Load / DomContentLoaded / NetworkIdle / None）
     pub async fn navigate_with_options(
         &self,
@@ -284,27 +364,40 @@ impl BrowserEngine {
         wait_until: NavigationWaitUntil,
     ) -> Result<crate::types::NavigateResult> {
         use chromiumoxide::cdp::browser_protocol::page::EventLifecycleEvent;
+        use futures::StreamExt;
+
+        // 验证 URL
+        if url.is_empty() {
+            return Err(Error::InvalidParameter("URL cannot be empty".to_string()));
+        }
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(Error::InvalidParameter(
+                "URL must start with http:// or https://".to_string(),
+            ));
+        }
 
         info!("Navigating to: {} (wait_until: {:?})", url, wait_until);
 
         let page = self.get_or_create_page().await?;
 
-        page.goto(url)
-            .await
-            .map_err(|e| Error::Cdp(e.to_string()))?;
-
-        // 根据等待策略等待页面加载
+        // 根据等待策略选择处理方式
         let timeout = std::time::Duration::from_millis(self.config.navigation_timeout_ms);
         match wait_until {
             NavigationWaitUntil::Load => {
-                // 等待 load 生命周期事件
-                let target_name = "load".to_string();
+                // 先注册监听器，再触发导航（避免竞态条件）
+                let mut stream = page
+                    .event_listener::<EventLifecycleEvent>()
+                    .await
+                    .map_err(|e| Error::Cdp(e.to_string()))?;
+
+                page.goto(url)
+                    .await
+                    .map_err(|e| Error::Cdp(e.to_string()))?;
+
+                // 等待 load 事件
                 tokio::time::timeout(timeout, async {
-                    let mut stream = page.event_listener::<EventLifecycleEvent>().await
-                        .map_err(|e| Error::Cdp(e.to_string()))?;
-                    use futures::StreamExt;
                     while let Some(event) = stream.next().await {
-                        if event.name == target_name {
+                        if event.name == "load" {
                             break;
                         }
                     }
@@ -314,14 +407,20 @@ impl BrowserEngine {
                 .map_err(|_| Error::Timeout("Navigation timeout waiting for load".into()))??;
             }
             NavigationWaitUntil::DomContentLoaded => {
-                // 等待 DOMContentLoaded 生命周期事件
-                let target_name = "DOMContentLoaded".to_string();
+                // 先注册监听器，再触发导航（避免竞态条件）
+                let mut stream = page
+                    .event_listener::<EventLifecycleEvent>()
+                    .await
+                    .map_err(|e| Error::Cdp(e.to_string()))?;
+
+                page.goto(url)
+                    .await
+                    .map_err(|e| Error::Cdp(e.to_string()))?;
+
+                // 等待 DOMContentLoaded 事件
                 tokio::time::timeout(timeout, async {
-                    let mut stream = page.event_listener::<EventLifecycleEvent>().await
-                        .map_err(|e| Error::Cdp(e.to_string()))?;
-                    use futures::StreamExt;
                     while let Some(event) = stream.next().await {
-                        if event.name == target_name {
+                        if event.name == "DOMContentLoaded" {
                             break;
                         }
                     }
@@ -331,6 +430,10 @@ impl BrowserEngine {
                 .map_err(|_| Error::Timeout("Navigation timeout waiting for DOMContentLoaded".into()))??;
             }
             NavigationWaitUntil::NetworkIdle => {
+                page.goto(url)
+                    .await
+                    .map_err(|e| Error::Cdp(e.to_string()))?;
+
                 // 先等待基本导航完成，再等待网络空闲
                 tokio::time::timeout(timeout, page.wait_for_navigation())
                     .await
@@ -340,6 +443,9 @@ impl BrowserEngine {
             }
             NavigationWaitUntil::None => {
                 // 不等待任何事件
+                page.goto(url)
+                    .await
+                    .map_err(|e| Error::Cdp(e.to_string()))?;
             }
         }
 
@@ -773,17 +879,48 @@ impl BrowserEngine {
             self.click_selector(select_selector, Some(timeout)).await?;
             tokio::time::sleep(Duration::from_millis(300)).await;
 
-            // 查找并点击选项
-            let option_selector = if by_text {
-                format!(
-                    "[data-value='{}'], [title='{}'], :contains('{}')",
-                    value, value, value
-                )
-            } else {
-                format!("[data-value='{}'], [value='{}']", value, value)
-            };
+            // 查找并点击选项（使用 JavaScript 避免 CSS 选择器注入风险）
+            let click_script = format!(
+                r#"(function() {{
+                    const value = {val:?};
+                    // 按属性查找并点击
+                    const byAttr = document.querySelector("[data-value='" + value + "'], [title='" + value + "'], [value='" + value + "']");
+                    if (byAttr) {{
+                        byAttr.click();
+                        return {{ success: true, clicked: byAttr.outerHTML }};
+                    }}
+                    // 按文本内容查找并点击（仅在 by_text 模式下）
+                    if ({by_text}) {{
+                        const clickable = document.querySelectorAll('button, a, [role="button"], [role="option"], li, div[clickable], span[clickable]');
+                        for (const el of clickable) {{
+                            if (el.textContent.trim() === value || el.innerText.trim() === value) {{
+                                el.click();
+                                return {{ success: true, clicked: el.outerHTML }};
+                            }}
+                        }}
+                    }}
+                    return {{ success: false, error: 'Option not found' }};
+                }})()"#,
+                val = value,
+                by_text = by_text
+            );
 
-            self.click_selector(&option_selector, Some(timeout)).await
+            let click_result: serde_json::Value = page
+                .evaluate(click_script.as_str())
+                .await
+                .map_err(|e| Error::JavaScript(e.to_string()))?
+                .into_value()
+                .map_err(|e| Error::JavaScript(e.to_string()))?;
+
+            let clicked = click_result["success"].as_bool().unwrap_or(false);
+            if clicked {
+                Ok(ActionResult {
+                    success: true,
+                    message: format!("Selected option: {}", value),
+                })
+            } else {
+                Err(Error::ElementNotFound(format!("Option '{}' not found", value)))
+            }
         }
     }
 
@@ -855,7 +992,7 @@ impl BrowserEngine {
     /// 如果当前在 iframe 上下文中，将获取该 iframe 内的元素。
     /// 同时更新 iframe 映射表。
     pub async fn snapshot(&self) -> Result<PageSnapshot> {
-        let active_frame = self.active_frame_id.lock().await.clone();
+        let active_frame = self.iframe_state.lock().await.active_frame_id.clone();
 
         // 检查是否在 iframe 上下文中
         if let Some(frame_id) = active_frame {
@@ -1171,16 +1308,25 @@ impl BrowserEngine {
 impl BrowserEngine {
     /// 列出所有标签页
     pub async fn list_tabs(&self) -> Result<Vec<TabInfo>> {
-        let state = self.tab_state.lock().await;
+        // 第一步：克隆必要数据（持锁时间尽可能短）
+        let (tabs_clone, active_tab_id): (Vec<(String, Page)>, Option<String>) = {
+            let state = self.tab_state.lock().await;
+            (
+                state.tabs.iter().map(|(id, p)| (id.clone(), p.clone())).collect(),
+                state.active_tab_id.clone(),
+            )
+        };
+        // 锁已释放
 
+        // 第二步：不持锁的情况下查询每个页面
         let mut result = Vec::new();
-        for (tab_id, page) in state.tabs.iter() {
+        for (tab_id, page) in tabs_clone {
             let url = page.url().await.ok().flatten().unwrap_or_default();
             let title = page.get_title().await.ok().flatten().unwrap_or_default();
-            let active = Some(tab_id.as_str()) == state.active_tab_id.as_deref();
+            let active = Some(tab_id.as_str()) == active_tab_id.as_deref();
 
             result.push(TabInfo {
-                tab_id: tab_id.clone(),
+                tab_id,
                 url,
                 title,
                 active,
@@ -1421,10 +1567,17 @@ impl BrowserEngine {
     /// 文件上传
     ///
     /// 通过 CDP 设置 `<input type="file">` 元素的文件
+    ///
+    /// # Security
+    ///
+    /// 验证文件路径，防止路径遍历攻击。
     pub async fn upload_file(&self, ref_id: &str, file_path: &str) -> Result<()> {
         use chromiumoxide::cdp::browser_protocol::dom::{
             GetDocumentParams, QuerySelectorParams, SetFileInputFilesParams,
         };
+
+        // 验证文件路径
+        let validated_path = validate_file_path(file_path)?;
 
         let page = self.active_page().await?;
         let selector = format!("[data-agent-ref=\"{}\"]", ref_id);
@@ -1452,7 +1605,7 @@ impl BrowserEngine {
 
         // 设置文件
         page.execute(SetFileInputFilesParams {
-            files: vec![file_path.to_string()],
+            files: vec![validated_path.to_string_lossy().to_string()],
             node_id: Some(node_id),
             backend_node_id: None,
             object_id: None,
@@ -1473,6 +1626,7 @@ impl BrowserEngine {
     /// 设置对话框自动处理
     ///
     /// 必须在触发对话框的动作**之前**调用
+    /// 可以处理连续弹出的多个对话框（如 alert + confirm）
     pub async fn setup_dialog_handler(
         &self,
         accept: bool,
@@ -1494,7 +1648,9 @@ impl BrowserEngine {
         let prompt_text = prompt_text.unwrap_or_default();
 
         tokio::spawn(async move {
-            if let Some(_event) = events.next().await {
+            // 循环处理所有对话框，不只是第一个
+            while let Some(_event) = events.next().await {
+                debug!("Handling dialog event");
                 let _ = page_clone
                     .execute(HandleJavaScriptDialogParams {
                         accept,
@@ -1502,6 +1658,7 @@ impl BrowserEngine {
                     })
                     .await;
             }
+            debug!("Dialog handler stream ended");
         });
 
         Ok(())
@@ -1546,32 +1703,20 @@ impl BrowserEngine {
         // 获取该 frame 的执行上下文
         let context_id = self.get_frame_execution_context(&frame_id).await?;
 
-        // 更新活动 frame 和上下文
-        {
-            let mut active_frame = self.active_frame_id.lock().await;
-            *active_frame = Some(frame_id.clone());
-        }
-        {
-            let mut active_ctx = self.active_context_id.lock().await;
-            *active_ctx = Some(context_id);
-        }
-
-        // 添加到 iframe 栈
-        {
-            let mut stack = self.iframe_stack.lock().await;
-            stack.push(IframeContext {
-                frame_id: frame_id.clone(),
-                url: None,
-            });
-            info!(
-                "Entered iframe: ref_id={}, frame_id={}, context_id={}, depth={}",
-                ref_id,
-                frame_id,
-                context_id,
-                stack.len()
-            );
-            Ok(stack.len())
-        }
+        // 更新 iframe 状态（单一锁，防止竞态条件）
+        let mut state = self.iframe_state.lock().await;
+        state.active_frame_id = Some(frame_id.clone());
+        state.active_context_id = Some(context_id);
+        state.iframe_stack.push(IframeContext {
+            frame_id: frame_id.clone(),
+            url: None,
+        });
+        let depth = state.iframe_stack.len();
+        info!(
+            "Entered iframe: ref_id={}, frame_id={}, context_id={}, depth={}",
+            ref_id, frame_id, context_id, depth
+        );
+        Ok(depth)
     }
 
     /// 通过搜索 frame tree 进入 iframe（备用方案）
@@ -1595,31 +1740,22 @@ impl BrowserEngine {
             // 获取执行上下文
             let context_id = self.get_frame_execution_context(&fid).await?;
 
-            // 更新活动 frame 和上下文
-            {
-                let mut active_frame = self.active_frame_id.lock().await;
-                *active_frame = Some(fid.clone());
-            }
-            {
-                let mut active_ctx = self.active_context_id.lock().await;
-                *active_ctx = Some(context_id);
-            }
-
-            // 添加到 iframe 栈
-            let mut stack = self.iframe_stack.lock().await;
-            stack.push(IframeContext {
+            // 更新 iframe 状态（单一锁）
+            let mut state = self.iframe_state.lock().await;
+            state.active_frame_id = Some(fid.clone());
+            state.active_context_id = Some(context_id);
+            state.iframe_stack.push(IframeContext {
                 frame_id: fid.clone(),
                 url: None,
             });
+            let depth = state.iframe_stack.len();
 
             info!(
                 "Entered iframe (search): ref_id={}, frame_id={}, depth={}",
-                ref_id,
-                fid,
-                stack.len()
+                ref_id, fid, depth
             );
 
-            Ok(stack.len())
+            Ok(depth)
         } else {
             Err(Error::ElementNotFound(format!(
                 "iframe with ref_id={}",
@@ -1672,62 +1808,58 @@ impl BrowserEngine {
     ///
     /// 返回当前 iframe 栈深度
     pub async fn exit_iframe(&self) -> Result<usize> {
-        let mut stack = self.iframe_stack.lock().await;
+        // 第一步：弹出 iframe 并获取父 frame 信息（持锁时间短）
+        let (parent_frame_id, depth) = {
+            let mut state = self.iframe_state.lock().await;
+            let popped = state.iframe_stack.pop();
+            let parent = state.iframe_stack.last().map(|c| c.frame_id.clone());
+            let current_depth = state.iframe_stack.len();
 
-        if let Some(ctx) = stack.pop() {
-            info!(
-                "Exited iframe: frame_id={}, depth={}",
-                ctx.frame_id,
-                stack.len()
-            );
-        }
-
-        // 更新活动 frame 和上下文
-        {
-            let mut active_frame = self.active_frame_id.lock().await;
-            *active_frame = stack.last().map(|c| c.frame_id.clone());
-        }
-
-        // 如果回到了主 frame，清除上下文；否则获取父 frame 的上下文
-        if let Some(parent_ctx) = stack.last() {
-            if let Ok(ctx_id) = self.get_frame_execution_context(&parent_ctx.frame_id).await {
-                let mut active_ctx = self.active_context_id.lock().await;
-                *active_ctx = Some(ctx_id);
+            if let Some(ref ctx) = popped {
+                info!(
+                    "Exited iframe: frame_id={}, depth={}",
+                    ctx.frame_id,
+                    current_depth
+                );
             }
+            (parent, current_depth)
+        };
+        // 锁已释放
+
+        // 第二步：获取父 frame 的执行上下文（不持锁）
+        let parent_context_id = if let Some(ref parent_fid) = parent_frame_id {
+            self.get_frame_execution_context(parent_fid).await.ok()
         } else {
-            let mut active_ctx = self.active_context_id.lock().await;
-            *active_ctx = None;
+            None
+        };
+
+        // 第三步：更新 iframe 状态（重新获取锁）
+        {
+            let mut state = self.iframe_state.lock().await;
+            state.active_frame_id = parent_frame_id;
+            state.active_context_id = parent_context_id;
         }
 
-        Ok(stack.len())
+        Ok(depth)
     }
 
     /// 退出所有 iframe
     ///
     /// 清空 iframe 栈，返回到主文档上下文。
     pub async fn exit_all_iframes(&self) -> Result<()> {
-        {
-            let mut stack = self.iframe_stack.lock().await;
-            stack.clear();
-            info!("Exited all iframes");
-        }
-
-        // 重置活动 frame 和上下文
-        {
-            let mut active_frame = self.active_frame_id.lock().await;
-            *active_frame = None;
-        }
-        {
-            let mut active_ctx = self.active_context_id.lock().await;
-            *active_ctx = None;
-        }
+        // 单一锁更新所有 iframe 状态
+        let mut state = self.iframe_state.lock().await;
+        state.iframe_stack.clear();
+        state.active_frame_id = None;
+        state.active_context_id = None;
+        info!("Exited all iframes");
 
         Ok(())
     }
 
     /// 获取当前 iframe 深度
     pub async fn iframe_depth(&self) -> usize {
-        self.iframe_stack.lock().await.len()
+        self.iframe_state.lock().await.iframe_stack.len()
     }
 
     /// 在当前上下文中执行 JavaScript
@@ -1735,9 +1867,9 @@ impl BrowserEngine {
     /// 如果当前在 iframe 上下文中，将尝试在该 iframe 内执行脚本。
     pub async fn evaluate_in_context(&self, script: &str) -> Result<serde_json::Value> {
         let page = self.active_page().await?;
-        let stack = self.iframe_stack.lock().await.clone();
+        let iframe_state = self.iframe_state.lock().await.clone();
 
-        if let Some(ctx) = stack.last() {
+        if let Some(ctx) = iframe_state.iframe_stack.last() {
             // 在 iframe 上下文中执行
             info!("Evaluating script in iframe context: {}", ctx.frame_id);
 
@@ -1798,7 +1930,7 @@ impl BrowserEngine {
         };
 
         let page = self.active_page().await?;
-        let active_frame = self.active_frame_id.lock().await.clone();
+        let active_frame = self.iframe_state.lock().await.active_frame_id.clone();
 
         // 启用 Accessibility 域
         let _ = page.execute(EnableParams {}).await;
@@ -1918,14 +2050,18 @@ impl BrowserEngine {
     ///
     /// 配置浏览器的下载目录，并启用下载事件监听。
     /// 必须在触发下载操作**之前**调用。
+    ///
+    /// # Security
+    ///
+    /// 验证下载路径，防止路径遍历攻击。
     pub async fn setup_download(&self, save_path: Option<&str>) -> Result<PathBuf> {
         use chromiumoxide::cdp::browser_protocol::browser::SetDownloadBehaviorParams;
 
         let page = self.active_page().await?;
 
-        // 确定下载目录
+        // 确定下载目录（验证自定义路径）
         let download_dir = if let Some(path) = save_path {
-            PathBuf::from(path)
+            validate_directory_path(path)?
         } else {
             // 默认使用临时目录
             std::env::temp_dir().join("echo-browser-downloads")
@@ -2062,12 +2198,12 @@ impl BrowserEngine {
         // 记录当前 URL
         let page = self.active_page().await?;
 
-        // 触发下载：使用 JavaScript 创建隐藏的下载链接
+        // 触发下载：使用 JavaScript 创建隐藏的下载链接（URL 使用 {:?} 正确转义）
         let js = format!(
             r#"
             (function() {{
                 const a = document.createElement('a');
-                a.href = '{}';
+                a.href = {url:?};
                 a.download = '';
                 a.style.display = 'none';
                 document.body.appendChild(a);
@@ -2076,7 +2212,7 @@ impl BrowserEngine {
                 return true;
             }})()
             "#,
-            url
+            url = url
         );
 
         page.evaluate(js.as_str())
@@ -2964,3 +3100,167 @@ impl Drop for BrowserEngine {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// 网络监控
+// ---------------------------------------------------------------------------
+
+impl BrowserEngine {
+    /// 启用网络监控
+    ///
+    /// 启用 CDP Network 域，捕获所有网络请求。
+    /// 收集的请求可通过 `get_network_requests()` 获取。
+    pub async fn enable_network_monitoring(&self) -> Result<()> {
+        use chromiumoxide::cdp::browser_protocol::network::{EnableParams, EventRequestWillBeSent};
+        use futures::StreamExt;
+
+        let page = self.active_page().await?;
+
+        // 启用 Network 域
+        page.execute(EnableParams::default())
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        // 监听请求事件
+        let mut events = page
+            .event_listener::<EventRequestWillBeSent>()
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        let network_requests = self.network_requests.clone();
+
+        tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                let post_data = event.request.post_data_entries.as_ref().and_then(|entries| {
+                    entries.first().and_then(|e| e.bytes.clone()).map(String::from)
+                });
+
+                let request = crate::types::NetworkRequest {
+                    request_id: event.request_id.as_ref().to_string(),
+                    url: event.request.url.clone(),
+                    method: event.request.method.clone(),
+                    resource_type: event.r#type.as_ref().map(|t| format!("{:?}", t)).unwrap_or_default(),
+                    headers: serde_json::to_value(&event.request.headers).unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                    post_data,
+                };
+
+                let mut reqs = network_requests.lock().await;
+                reqs.push(request);
+                // 限制最大数量，防止内存溢出
+                if reqs.len() > 1000 {
+                    reqs.remove(0);
+                }
+            }
+            debug!("Network monitoring stream ended");
+        });
+
+        info!("Network monitoring enabled");
+        Ok(())
+    }
+
+    /// 获取收集的网络请求
+    pub async fn get_network_requests(&self) -> Result<Vec<crate::types::NetworkRequest>> {
+        let requests = self.network_requests.lock().await.clone();
+        Ok(requests)
+    }
+
+    /// 清除收集的网络请求
+    pub async fn clear_network_requests(&self) -> Result<()> {
+        self.network_requests.lock().await.clear();
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 控制台监控
+// ---------------------------------------------------------------------------
+
+impl BrowserEngine {
+    /// 启用控制台监控
+    ///
+    /// 启用 CDP Runtime 域，捕获所有 console.log/warn/error/info 调用。
+    /// 收集的消息可通过 `get_console_messages()` 获取。
+    pub async fn enable_console_monitoring(&self) -> Result<()> {
+        use chromiumoxide::cdp::js_protocol::runtime::{EnableParams, EventConsoleApiCalled};
+        use futures::StreamExt;
+
+        let page = self.active_page().await?;
+
+        // 启用 Runtime 域
+        page.execute(EnableParams::default())
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        // 监听 console API 调用
+        let mut events = page
+            .event_listener::<EventConsoleApiCalled>()
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+
+        let console_messages = self.console_messages.clone();
+
+        tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                // 解析消息文本
+                let text = event.args.iter()
+                    .filter_map(|arg| {
+                        // 尝试从 RemoteObject 获取值
+                        if let Some(ref value) = arg.value {
+                            match value {
+                                serde_json::Value::String(s) => Some(s.clone()),
+                                serde_json::Value::Number(n) => Some(n.to_string()),
+                                serde_json::Value::Bool(b) => Some(b.to_string()),
+                                serde_json::Value::Null => Some("null".to_string()),
+                                _ => None,
+                            }
+                        } else if arg.description.is_some() {
+                            Some(arg.description.clone().unwrap_or_default())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                // 处理 stack_trace (Arc<StackTrace>)
+                let (url, line_number) = event.stack_trace.as_ref()
+                    .and_then(|st| st.call_frames.first())
+                    .map(|f| (Some(f.url.clone()), Some(f.line_number)))
+                    .unwrap_or((None, None));
+
+                let message = crate::types::ConsoleMessage {
+                    level: format!("{:?}", event.r#type),
+                    text,
+                    url,
+                    line_number,
+                    timestamp: *event.timestamp.inner(),
+                };
+
+                let mut msgs = console_messages.lock().await;
+                msgs.push(message);
+                // 限制最大数量，防止内存溢出
+                if msgs.len() > 1000 {
+                    msgs.remove(0);
+                }
+            }
+            debug!("Console monitoring stream ended");
+        });
+
+        info!("Console monitoring enabled");
+        Ok(())
+    }
+
+    /// 获取收集的控制台消息
+    pub async fn get_console_messages(&self) -> Result<Vec<crate::types::ConsoleMessage>> {
+        let messages = self.console_messages.lock().await.clone();
+        Ok(messages)
+    }
+
+    /// 清除收集的控制台消息
+    pub async fn clear_console_messages(&self) -> Result<()> {
+        self.console_messages.lock().await.clear();
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------

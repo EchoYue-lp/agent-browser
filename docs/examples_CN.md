@@ -11,6 +11,8 @@
 - [身份认证](#身份认证)
 - [文件操作](#文件操作)
 - [多标签页操作](#多标签页操作)
+- [网络与控制台监控](#网络与控制台监控)
+- [视口设置](#视口设置)
 
 ## 网页数据抓取
 
@@ -313,6 +315,53 @@ for tab in tabs.iter().skip(1) {
 }
 ```
 
+## 网络与控制台监控
+
+### 网络请求监控
+
+```bash
+# 启用网络监控
+curl -X POST http://localhost:3000/network/enable
+
+# 获取捕获的网络请求
+curl http://localhost:3000/network/requests
+
+# 清除请求记录
+curl -X POST http://localhost:3000/network/clear
+```
+
+### 控制台消息监控
+
+```bash
+# 启用控制台监控
+curl -X POST http://localhost:3000/console/enable
+
+# 获取控制台消息
+curl http://localhost:3000/console/messages
+
+# 清除消息记录
+curl -X POST http://localhost:3000/console/clear
+```
+
+## 视口设置
+
+### 模拟不同设备
+
+```bash
+# 设置视口大小（模拟桌面）
+curl -X POST http://localhost:3000/viewport \
+  -H "Content-Type: application/json" \
+  -d '{"width": 1920, "height": 1080}'
+
+# 设置视口大小（模拟移动设备）
+curl -X POST http://localhost:3000/viewport \
+  -H "Content-Type: application/json" \
+  -d '{"width": 375, "height": 667, "device_scale_factor": 2}'
+
+# 获取当前视口大小
+curl http://localhost:3000/viewport
+```
+
 ## 截图
 
 ### 各种截图选项
@@ -338,6 +387,46 @@ let screenshot = engine.screenshot(Some(ScreenshotOptions {
 })).await?;
 
 std::fs::write("screenshot.png", base64::decode(&screenshot.data)?)?;
+```
+
+## 键盘快捷键
+
+### 发送快捷键
+
+```bash
+# 复制
+curl -X POST http://localhost:3000/shortcut \
+  -H "Content-Type: application/json" \
+  -d '{"shortcut": "copy"}'
+
+# 粘贴
+curl -X POST http://localhost:3000/shortcut \
+  -H "Content-Type: application/json" \
+  -d '{"shortcut": "paste"}'
+
+# 全选
+curl -X POST http://localhost:3000/shortcut \
+  -H "Content-Type: application/json" \
+  -d '{"shortcut": "selectAll"}'
+
+# 刷新
+curl -X POST http://localhost:3000/shortcut \
+  -H "Content-Type: application/json" \
+  -d '{"shortcut": "refresh"}'
+```
+
+### 带修饰键的按键
+
+```bash
+# Ctrl+C
+curl -X POST http://localhost:3000/press-key \
+  -H "Content-Type: application/json" \
+  -d '{"key": "c", "modifiers": ["control"]}'
+
+# Ctrl+Shift+I（开发者工具）
+curl -X POST http://localhost:3000/press-key \
+  -H "Content-Type: application/json" \
+  -d '{"key": "i", "modifiers": ["control", "shift"]}'
 ```
 
 ## 错误处理

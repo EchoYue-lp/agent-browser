@@ -4,7 +4,7 @@ This guide will help you get Agent Browser up and running quickly.
 
 ## Prerequisites
 
-- **Rust** 1.75 or later
+- **Rust** 1.85 or later
 - **Chrome** or **Chromium** browser (automatically detected)
 
 ## Installation
@@ -18,7 +18,7 @@ cargo build --release
 ```
 
 The binaries will be available at `target/release/`:
-- `agent-browser-mcp` - MCP Server
+- `agent-browser-mcp` - MCP Server (STDIO transport)
 - `agent-browser-http` - HTTP API Server
 
 ## Usage
@@ -27,9 +27,15 @@ The binaries will be available at `target/release/`:
 
 Configure Agent Browser as an MCP server for AI assistants.
 
+Agent Browser implements [MCP 2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25) specification with:
+- 30+ browser automation tools with annotations
+- Resources for screenshot and snapshot access
+- Pre-defined prompts for common tasks
+- Logging capability
+
 #### Claude Code
 
-Edit `~/.claude/config.json`:
+Edit `~/.claude/settings.json`:
 
 ```json
 {
@@ -59,7 +65,7 @@ Edit your Cursor settings:
 
 For any MCP-compatible client, add the server configuration with:
 - **Command**: Path to `agent-browser-mcp` binary
-- **Protocol**: MCP (stdio transport)
+- **Protocol**: MCP 2025-11-25 (STDIO transport)
 
 Once configured, you can ask your AI assistant to browse the web:
 
@@ -81,6 +87,7 @@ Start the HTTP server for RESTful API access:
 BROWSER_HTTP_PORT=8080 \
 BROWSER_HEADLESS=1 \
 BROWSER_API_KEY=your-secret-key \
+BROWSER_DEFAULT_TIMEOUT_MS=60000 \
 ./target/release/agent-browser-http
 ```
 
@@ -110,7 +117,7 @@ Use Agent Browser directly in your Rust project.
 
 ```toml
 [dependencies]
-agent-browser-core = "0.1"
+agent-browser-core = "0.2"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0"
 ```

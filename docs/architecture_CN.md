@@ -11,15 +11,14 @@ Agent Browser 采用模块化设计，职责分离清晰：
 │                    AI Agent (MCP 客户端)                        │
 │  Claude Code | Cursor | OpenAI | 自定义 Agent                   │
 └────────────────────────────┬────────────────────────────────────┘
-                             │ MCP 协议 (stdio)
+                             │ MCP 2025-11-25 (stdio)
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                   agent-browser-mcp (MCP Server)                 │
-│  - 17 个 MCP 工具                                               │
-│  - JSON-RPC 2.0 协议                                            │
-│  - 工具发现与执行                                                │
+│                   agent-browser-mcp (MCP 服务端)                 │
+│  Tools (30+) | Resources | Prompts | Logging                    │
+│  协议: 2025-11-25 | 传输: stdio, sse, http                       │
 └────────────────────────────┬────────────────────────────────────┘
-                             │ 内部 API
+                             │ 复用
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                   agent-browser-core (核心库)                    │
@@ -105,34 +104,61 @@ pub async fn dispatch_action(
 
 ### agent-browser-mcp
 
-为 AI Agent 实现的 MCP Server。
+为 AI Agent 实现的 MCP 服务端。
 
 #### 协议处理器
 
-JSON-RPC 2.0 实现：
+基于 MCP 2025-11-25 的 JSON-RPC 2.0 实现：
 
 ```rust
 fn handle_request(request: Request, state: &ServerState) -> Response
 ```
 
 方法：
-- `initialize` - 服务器能力
-- `tools/list` - 可用工具
+- `initialize` - 服务端能力与版本协商
+- `tools/list` - 可用工具（带注解）
 - `tools/call` - 执行工具
+- `resources/list` - 可用资源
+- `resources/read` - 读取资源内容
+- `prompts/list` - 可用提示词
+- `prompts/get` - 获取提示词消息
+- `logging/setLevel` - 设置日志级别
+
+#### 传输层
+
+模块化传输架构：
+
+| 传输 | 状态 | 描述 |
+|------|------|------|
+| **STDIO** | 生产可用 | 标准输入/输出（默认） |
+| **SSE** | 客户端实现 | Server-Sent Events |
+| **HTTP** | 客户端实现 | Streamable HTTP |
 
 #### 工具定义
 
-每个工具有：
-- 名称和描述
-- 输入模式（JSON Schema）
-- 处理函数
+每个工具符合 MCP 2025-11-25 规范结构：
 
 ```rust
 struct Tool {
     name: String,
-    description: String,
+    title: Option<String>,
+    description: Option<String>,
     input_schema: serde_json::Value,
-    handler: fn(Value, &ServerState) -> Result<Value>,
+    output_schema: Option<Value>,
+    annotations: Option<ToolAnnotations>,
+}
+```
+
+#### 工具注解
+
+工具包含行为注解：
+
+```rust
+struct ToolAnnotations {
+    read_only_hint: Option<bool>,
+    destructive_hint: Option<bool>,
+    idempotent_hint: Option<bool>,
+    open_world_hint: Option<bool>,
 }
 ```
 
@@ -162,6 +188,48 @@ async fn ws_handler(
     State(state): State<Arc<AppState>>,
 ) -> Response
 ```
+
+## MCP 2025-11-25 特性
+
+### 协议版本协商
+
+```rust
+pub fn negotiate_version(client_version: &str) -> String {
+    if SUPPORTED_PROTOCOL_VERSIONS.contains(&client_version) {
+        client_version.to_string()
+    } else {
+        MCP_PROTOCOL_VERSION.to_string()  // 回退到最新版本
+    }
+}
+```
+
+支持版本: `2025-11-25`、`2025-06-18`、`2025-03-26`、`2024-11-05`
+
+### 服务端能力
+
+```rust
+pub struct ServerCapabilities {
+    pub tools: Option<ToolsCapability>,      // listChanged 支持
+    pub resources: Option<ResourcesCapability>, // subscribe, listChanged
+    pub prompts: Option<PromptsCapability>,   // listChanged
+    pub logging: Option<LoggingCapability>,
+}
+```
+
+### 资源
+
+| 资源 URI | 描述 | MIME 类型 |
+|----------|------|-----------|
+| `resource://browser/screenshot` | 当前页面截图 | `image/png` |
+| `resource://browser/snapshot` | Accessibility Tree 快照 | `text/plain` |
+
+### 提示词
+
+| 提示词 | 描述 | 参数 |
+|--------|------|------|
+| `analyze_page` | 分析页面结构 | `focus_area`（可选） |
+| `fill_form` | 表单填写指南 | `form_data`（必填） |
+| `extract_data` | 数据提取指南 | `selectors`（可选） |
 
 ## 设计决策
 
@@ -194,8 +262,8 @@ Agent Browser 提供三种接口：
 
 1. **MCP (stdio)**：最适合 AI Agent
    - 零网络开销
-   - 标准协议
-   - 内置工具发现
+   - 标准协议，支持 Tools、Resources、Prompts
+   - 内置工具发现和注解
 
 2. **HTTP API**：最适合集成
    - 任意 HTTP 客户端
@@ -297,17 +365,24 @@ Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 1. 在 `tools.rs` 中定义工具：
 
 ```rust
-fn tool_my_action() -> Tool {
-    Tool {
-        name: "browser_my_action".to_string(),
-        description: "描述".to_string(),
-        input_schema: json!({
+fn tool_my_action() -> ToolDefinition {
+    ToolDefinition {
+        name: "browser_my_action",
+        title: Some("我的操作"),
+        description: "描述",
+        input_schema: || json!({
             "type": "object",
             "properties": {
                 "param": {"type": "string"}
             },
             "required": ["param"]
         }),
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        },
     }
 }
 ```
