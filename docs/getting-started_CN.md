@@ -4,7 +4,7 @@
 
 ## 前置要求
 
-- **Rust** 1.85 或更高版本
+- **Rust** 1.88 或更高版本
 - **Chrome** 或 **Chromium** 浏览器（自动检测）
 
 ## 安装
@@ -125,7 +125,7 @@ anyhow = "1.0"
 #### 基本使用
 
 ```rust
-use agent_browser_core::{BrowserEngine, BrowserConfig};
+use agent_browser_core::{ActionKind, BrowserEngine, BrowserConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -140,8 +140,10 @@ async fn main() -> anyhow::Result<()> {
     println!("标题: {}", snapshot.title);
     println!("节点数: {}", snapshot.nodes.len());
 
-    // 使用 ref_id 点击元素
-    engine.click("ax1").await?;
+    // 将操作绑定到生成 ref_id 的快照
+    engine
+        .act_with_snapshot(&snapshot.snapshot_id, "ax1", ActionKind::Click)
+        .await?;
 
     // 或使用 CSS 选择器直接操作（推荐）
     engine.click_selector("button.submit", None).await?;
@@ -196,9 +198,13 @@ let engine = BrowserEngine::new(config);
 | `BROWSER_HTTP_HOST` | 监听地址 | `127.0.0.1` |
 | `BROWSER_HTTP_PORT` | 服务器端口 | `3000` |
 | `BROWSER_HEADLESS` | 浏览器显示模式 | 新无头 |
+| `BROWSER_NO_SANDBOX` | 显式禁用 Chrome 沙箱 | `false` |
 | `BROWSER_API_KEY` | API 认证密钥 | - |
 | `BROWSER_DEFAULT_TIMEOUT_MS` | 默认超时时间（毫秒） | `30000` |
 | `BROWSER_ALLOWED_FILE_ROOTS` | 上传/下载允许目录 | 当前目录和临时目录 |
+| `BROWSER_ALLOWED_ORIGINS` | 逗号分隔的 Origin 白名单 | 不限制公网 Origin |
+| `BROWSER_BLOCKED_ORIGINS` | 逗号分隔的 Origin 黑名单 | - |
+| `BROWSER_ALLOW_PRIVATE_NETWORKS` | 允许私网/回环目标 | `false` |
 
 ## 下一步
 

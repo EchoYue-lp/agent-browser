@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/agent-browser.svg)](https://crates.io/crates/agent-browser)
 [![Docs.rs](https://docs.rs/agent-browser/badge.svg)](https://docs.rs/agent-browser)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 
 **Browser automation toolkit designed for AI Agents.**
 
@@ -35,7 +35,7 @@ Binaries available at `target/release/`:
 
 ### Prerequisites
 
-- Rust 1.85+
+- Rust 1.88+
 - Chrome or Chromium browser (auto-detected)
 
 ## 🚀 Quick Start
@@ -89,7 +89,7 @@ curl "http://localhost:3000/screenshot?full_page=true" | jq -r '.data.image' | b
 Use directly in your Rust project:
 
 ```rust
-use agent_browser_core::{BrowserEngine, BrowserConfig};
+use agent_browser_core::{ActionKind, BrowserEngine, BrowserConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -99,8 +99,10 @@ async fn main() -> anyhow::Result<()> {
     let snapshot = engine.snapshot().await?;
     println!("Title: {}", snapshot.title);
 
-    // Click using ref_id
-    engine.click("ax1").await?;
+    // Bind actions to the observation that produced the ref_id.
+    engine
+        .act_with_snapshot(&snapshot.snapshot_id, "ax1", ActionKind::Click)
+        .await?;
 
     // Or use CSS selector directly (recommended)
     engine.click_selector("button.submit", None).await?;
@@ -128,6 +130,7 @@ Agent Browser implements the [MCP 2025-11-25](https://modelcontextprotocol.io/sp
 | **Resources** | Screenshot and snapshot as resources |
 | **Prompts** | Pre-defined prompts for common tasks |
 | **Logging** | Configurable log levels |
+| **Tasks** | Durable execution, polling, result retrieval, and cancellation |
 
 ### Transport
 
@@ -154,9 +157,9 @@ Agent Browser implements the [MCP 2025-11-25](https://modelcontextprotocol.io/sp
 
 | Tool | Description | Annotations |
 |------|-------------|-------------|
-| `browser_click` | Click element (by ref_id) | - |
-| `browser_type` | Type text into element | - |
-| `browser_press` | Press key on element | - |
+| `browser_click` | Click by `snapshot_id` + `ref_id` | - |
+| `browser_type` | Type by `snapshot_id` + `ref_id` | - |
+| `browser_press` | Press key by `snapshot_id` + `ref_id` | - |
 | `browser_press_key` | Press key with modifiers | - |
 | `browser_shortcut` | Send keyboard shortcut | - |
 | `browser_scroll` | Scroll page | `idempotentHint: true` |
@@ -237,8 +240,11 @@ Pre-defined prompts for common browser tasks:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/navigate` | POST | Navigate to URL |
-| `/snapshot` | GET | Get Accessibility Tree |
-| `/act` | POST | Perform element action |
+| `/snapshot` | GET | Get a compact Accessibility Tree and `snapshot_id` |
+| `/snapshot/search` | POST | Search the latest snapshot |
+| `/act` | POST | Perform a snapshot-bound element action |
+| `/sessions` | POST/GET | Create or list isolated browser sessions |
+| `/sessions/{id}` | DELETE | Shut down an isolated session |
 | `/screenshot` | GET | Take screenshot |
 | `/wait` | POST | Wait for selector/timeout |
 | `/evaluate` | POST | Execute JavaScript |
@@ -276,12 +282,19 @@ Pre-defined prompts for common browser tasks:
 BROWSER_HTTP_HOST=127.0.0.1   # Bind address (default: loopback only)
 BROWSER_HTTP_PORT=8080         # Server port (default: 3000)
 BROWSER_HEADLESS=1             # Enable headless mode
+BROWSER_NO_SANDBOX=false       # Explicitly disable Chrome sandbox only when required
 BROWSER_API_KEY=secret123      # API key for authentication
 BROWSER_DEFAULT_TIMEOUT_MS=60000  # Default timeout in ms
 BROWSER_ALLOWED_FILE_ROOTS=/tmp:/path/to/workspace  # Upload/download roots
+BROWSER_ALLOWED_ORIGINS=https://example.com,https://*.example.org
+BROWSER_BLOCKED_ORIGINS=https://admin.example.com
+BROWSER_ALLOW_PRIVATE_NETWORKS=false  # Blocks loopback/private/link-local targets by default
+BROWSER_CAPTURE_SENSITIVE_DATA=false  # Redacts auth/cookie/request bodies by default
+BROWSER_MCP_CAPS=network,storage,files,devtools  # Optional MCP capability allowlist
 ```
 
 Binding to a non-loopback address requires `BROWSER_API_KEY`.
+HTTP clients can select an isolated session with the `X-Browser-Session` header.
 
 ### Rust Configuration
 

@@ -30,10 +30,20 @@ pub struct BrowserConfig {
     pub action_timeout_ms: u64,
     /// Enable anti-detection scripts.
     pub stealth: bool,
+    /// Disable the Chrome process sandbox. Only use in explicitly isolated containers.
+    pub no_sandbox: bool,
     /// Extra browser launch arguments.
     pub extra_args: Vec<String>,
     /// Filesystem roots that uploads and downloads may access.
     pub allowed_file_roots: Vec<PathBuf>,
+    /// Exact origins or wildcard subdomains that the browser may access.
+    pub allowed_origins: Vec<String>,
+    /// Origins that the browser must not access. Evaluated before the allowlist.
+    pub blocked_origins: Vec<String>,
+    /// Allow loopback, link-local, and private network destinations.
+    pub allow_private_networks: bool,
+    /// Include sensitive request headers and request bodies in monitoring output.
+    pub capture_sensitive_data: bool,
 }
 
 impl Default for BrowserConfig {
@@ -53,13 +63,68 @@ impl Default for BrowserConfig {
             navigation_timeout_ms: 30_000,
             action_timeout_ms: 10_000,
             stealth: true,
+            no_sandbox: false,
             extra_args: Vec::new(),
             allowed_file_roots,
+            allowed_origins: Vec::new(),
+            blocked_origins: Vec::new(),
+            allow_private_networks: false,
+            capture_sensitive_data: false,
         }
     }
 }
 
 impl BrowserConfig {
+    /// Build browser configuration from `BROWSER_*` environment variables.
+    pub fn from_env() -> Self {
+        let mut config = Self::default();
+        if let Ok(headless) = std::env::var("BROWSER_HEADLESS") {
+            config.headless = match headless.to_ascii_lowercase().as_str() {
+                "0" | "false" | "no" => HeadlessMode::None,
+                "old" => HeadlessMode::Old,
+                _ => HeadlessMode::New,
+            };
+        }
+        if let Some(value) = env_bool("BROWSER_STEALTH") {
+            config.stealth = value;
+        }
+        if let Some(value) = env_bool("BROWSER_NO_SANDBOX") {
+            config.no_sandbox = value;
+        }
+        if let Some(value) = env_bool("BROWSER_ALLOW_PRIVATE_NETWORKS") {
+            config.allow_private_networks = value;
+        }
+        if let Some(value) = env_bool("BROWSER_CAPTURE_SENSITIVE_DATA") {
+            config.capture_sensitive_data = value;
+        }
+        if let Ok(value) = std::env::var("BROWSER_NAVIGATION_TIMEOUT_MS")
+            && let Ok(timeout) = value.parse()
+        {
+            config.navigation_timeout_ms = timeout;
+        }
+        if let Ok(value) = std::env::var("BROWSER_ACTION_TIMEOUT_MS")
+            && let Ok(timeout) = value.parse()
+        {
+            config.action_timeout_ms = timeout;
+        }
+        if let Some(path) = std::env::var_os("BROWSER_PATH") {
+            config.browser_path = Some(path.into());
+        }
+        if let Some(path) = std::env::var_os("BROWSER_PROFILE_DIR") {
+            config.profile_dir = Some(path.into());
+        }
+        if let Some(roots) = std::env::var_os("BROWSER_ALLOWED_FILE_ROOTS") {
+            config.allowed_file_roots = std::env::split_paths(&roots).collect();
+        }
+        if let Ok(origins) = std::env::var("BROWSER_ALLOWED_ORIGINS") {
+            config.allowed_origins = split_list(&origins);
+        }
+        if let Ok(origins) = std::env::var("BROWSER_BLOCKED_ORIGINS") {
+            config.blocked_origins = split_list(&origins);
+        }
+        config
+    }
+
     /// Create a headless configuration (new headless mode).
     pub fn headless() -> Self {
         Self {
@@ -108,6 +173,12 @@ impl BrowserConfig {
         self
     }
 
+    /// Enable or disable Chrome's `--no-sandbox` launch flag.
+    pub fn with_no_sandbox(mut self, no_sandbox: bool) -> Self {
+        self.no_sandbox = no_sandbox;
+        self
+    }
+
     /// Add a browser launch argument.
     pub fn with_arg(mut self, arg: impl Into<String>) -> Self {
         self.extra_args.push(arg.into());
@@ -127,6 +198,38 @@ impl BrowserConfig {
         P: Into<PathBuf>,
     {
         self.allowed_file_roots = roots.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Replace the exact/wildcard origins that navigation may access.
+    pub fn with_allowed_origins<I, S>(mut self, origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_origins = origins.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Replace the origins that navigation must reject.
+    pub fn with_blocked_origins<I, S>(mut self, origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.blocked_origins = origins.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Allow or reject private network destinations.
+    pub fn with_private_networks(mut self, allow: bool) -> Self {
+        self.allow_private_networks = allow;
+        self
+    }
+
+    /// Include or redact sensitive network monitoring data.
+    pub fn with_sensitive_network_data(mut self, capture: bool) -> Self {
+        self.capture_sensitive_data = capture;
         self
     }
 
@@ -183,6 +286,24 @@ impl BrowserConfig {
 
         None
     }
+}
+
+fn env_bool(name: &str) -> Option<bool> {
+    std::env::var(name).ok().map(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn split_list(value: &str) -> Vec<String> {
+    value
+        .split([';', ','])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 /// Navigation wait strategy.
@@ -379,6 +500,32 @@ pub struct ViewportSize {
     pub height: u32,
     /// Device scale factor (default 1.0).
     pub device_scale_factor: Option<f64>,
+}
+
+/// Lifecycle and page events emitted by the browser runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum BrowserEvent {
+    BrowserCrashed,
+    Navigated {
+        url: String,
+        title: String,
+    },
+    ActionCompleted {
+        action: String,
+        ref_id: String,
+    },
+    DownloadCompleted(DownloadResult),
+    DialogOpened {
+        message: String,
+        dialog_type: String,
+    },
+    TabActivated {
+        tab_id: String,
+    },
+    TabClosed {
+        tab_id: String,
+    },
 }
 
 /// Keyboard modifier keys.

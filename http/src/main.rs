@@ -40,8 +40,8 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::{
     Json, Router,
-    extract::{Path, Query, Request, State},
-    http::StatusCode,
+    extract::{FromRequestParts, Path, Query, Request, State},
+    http::{StatusCode, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -50,12 +50,12 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::{RwLock, broadcast};
 use tracing::info;
 
 use agent_browser_core::{
-    BrowserConfig, BrowserEngine, HeadlessMode, NavigationWaitUntil, ScreenshotOptions,
-    SetCookieParam, SnapshotNode, TabInfo, actions::ActionResult,
+    ActionKind, BrowserConfig, BrowserEngine, NavigationWaitUntil, PageSnapshot, ScreenshotOptions,
+    SetCookieParam, SnapshotDiff, SnapshotNode, SnapshotOptions, TabInfo, actions::ActionResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -70,6 +70,51 @@ pub struct AppState {
     pub config: HttpConfig,
     /// Event broadcast channel for WebSocket
     pub event_tx: EventBroadcast,
+    /// Explicitly isolated browser sessions.
+    pub sessions: RwLock<std::collections::HashMap<String, Arc<BrowserEngine>>>,
+}
+
+pub struct SessionEngine {
+    engine: Arc<BrowserEngine>,
+    session_id: String,
+}
+
+#[axum::async_trait]
+impl FromRequestParts<Arc<AppState>> for SessionEngine {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let session_id = parts
+            .headers
+            .get("X-Browser-Session")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty());
+        let Some(session_id) = session_id else {
+            return Ok(Self {
+                engine: state.engine.clone(),
+                session_id: "default".to_string(),
+            });
+        };
+        let engine = state.sessions.read().await.get(session_id).cloned();
+        engine
+            .map(|engine| Self {
+                engine,
+                session_id: session_id.to_string(),
+            })
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ApiError {
+                        error: "session_not_found".to_string(),
+                        details: Some(format!("Unknown browser session: {session_id}")),
+                    }),
+                )
+                    .into_response()
+            })
+    }
 }
 
 /// HTTP server configuration
@@ -146,11 +191,41 @@ fn ok_empty() -> ApiSuccess<serde_json::Value> {
     }
 }
 
-fn emit_event(state: &AppState, event_type: &str, data: serde_json::Value) {
+fn emit_event(state: &AppState, session_id: &str, event_type: &str, data: serde_json::Value) {
     let _ = state.event_tx.send(serde_json::json!({
         "type": event_type,
+        "session_id": session_id,
         "data": data,
     }));
+}
+
+fn forward_browser_events(
+    engine: Arc<BrowserEngine>,
+    event_tx: EventBroadcast,
+    session_id: String,
+) {
+    let mut events = engine.subscribe_events();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => {
+                    let _ = event_tx.send(serde_json::json!({
+                        "type": "browser_event",
+                        "session_id": session_id,
+                        "event": event,
+                    }));
+                }
+                Err(broadcast::error::RecvError::Lagged(dropped)) => {
+                    let _ = event_tx.send(serde_json::json!({
+                        "type": "browser_event_lagged",
+                        "session_id": session_id,
+                        "dropped": dropped,
+                    }));
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 fn parse_wait_until(value: Option<&str>) -> Result<NavigationWaitUntil, String> {
@@ -207,8 +282,28 @@ pub struct ScreenshotQuery {
     pub selector: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct SnapshotQuery {
+    #[serde(default)]
+    pub interactive_only: Option<bool>,
+    #[serde(default)]
+    pub root_ref: Option<String>,
+    #[serde(default)]
+    pub max_depth: Option<usize>,
+    #[serde(default)]
+    pub max_nodes: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SnapshotSearchRequest {
+    pub query: String,
+    #[serde(default)]
+    pub max_results: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ActRequest {
+    pub snapshot_id: String,
     pub ref_id: String,
     pub action: String,
     #[serde(default)]
@@ -251,6 +346,7 @@ pub struct SetCookiesRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct UploadRequest {
+    pub snapshot_id: String,
     pub ref_id: String,
     pub file_path: String,
 }
@@ -340,6 +436,7 @@ pub struct NavigateResponse {
 
 #[derive(Debug, Serialize)]
 pub struct SnapshotResponse {
+    pub snapshot_id: String,
     pub url: String,
     pub title: String,
     pub nodes: Vec<SnapshotNode>,
@@ -364,6 +461,14 @@ pub struct ScreenshotResponse {
     pub format: String,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActionResponse {
+    pub action: ActionResult,
+    pub snapshot: PageSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<SnapshotDiff>,
 }
 
 // ---------------------------------------------------------------------------
@@ -403,14 +508,91 @@ async fn auth_middleware(
 // Handlers
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Serialize)]
+pub struct SessionInfo {
+    pub session_id: String,
+    pub browser_running: bool,
+    pub responsive: bool,
+}
+
+/// POST /sessions - Create an isolated browser session.
+pub async fn create_session(State(state): State<Arc<AppState>>) -> Json<ApiSuccess<SessionInfo>> {
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let engine = Arc::new(BrowserEngine::new(state.config.browser.clone()));
+    forward_browser_events(engine.clone(), state.event_tx.clone(), session_id.clone());
+    state
+        .sessions
+        .write()
+        .await
+        .insert(session_id.clone(), engine);
+    Json(ok(SessionInfo {
+        session_id,
+        browser_running: false,
+        responsive: true,
+    }))
+}
+
+/// GET /sessions - List explicit browser sessions.
+pub async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+) -> Json<ApiSuccess<Vec<SessionInfo>>> {
+    let sessions = state
+        .sessions
+        .read()
+        .await
+        .iter()
+        .map(|(id, engine)| (id.clone(), engine.clone()))
+        .collect::<Vec<_>>();
+    let mut result = Vec::with_capacity(sessions.len());
+    for (session_id, engine) in sessions {
+        let browser_running = engine.is_launched().await;
+        let responsive = !browser_running || engine.health_check().await;
+        result.push(SessionInfo {
+            session_id,
+            browser_running,
+            responsive,
+        });
+    }
+    Json(ok(result))
+}
+
+/// DELETE /sessions/{session_id} - Close and remove a browser session.
+pub async fn delete_session(
+    State(state): State<Arc<AppState>>,
+    Path(session_id): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<ApiError>)> {
+    let engine = state
+        .sessions
+        .write()
+        .await
+        .remove(&session_id)
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new(
+                    "session_not_found",
+                    format!("Unknown browser session: {session_id}"),
+                )),
+            )
+        })?;
+    engine.shutdown().await.map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiError::new("session_shutdown_failed", error)),
+        )
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// POST /navigate
 pub async fn navigate(
     State(state): State<Arc<AppState>>,
+    SessionEngine { engine, session_id }: SessionEngine,
     Json(req): Json<NavigateRequest>,
 ) -> Result<Json<ApiSuccess<NavigateResponse>>, (StatusCode, Json<ApiError>)> {
     info!("Navigate: {}", req.url);
 
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let wait_until = parse_wait_until(req.wait_until.as_deref()).map_err(|error| {
         (
@@ -431,6 +613,7 @@ pub async fn navigate(
 
     emit_event(
         &state,
+        &session_id,
         "navigation",
         serde_json::json!({
             "url": &result.final_url,
@@ -447,16 +630,26 @@ pub async fn navigate(
 
 /// GET /snapshot
 pub async fn snapshot(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
+    Query(req): Query<SnapshotQuery>,
 ) -> Result<Json<ApiSuccess<SnapshotResponse>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
-    let snap = engine.snapshot().await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiError::new("snapshot_failed", e)),
-        )
-    })?;
+    let defaults = SnapshotOptions::default();
+    let snap = engine
+        .snapshot_with_options(SnapshotOptions {
+            interactive_only: req.interactive_only.unwrap_or(defaults.interactive_only),
+            root_ref: req.root_ref,
+            max_depth: req.max_depth.or(defaults.max_depth),
+            max_nodes: req.max_nodes.unwrap_or(defaults.max_nodes).clamp(1, 5_000),
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("snapshot_failed", e)),
+            )
+        })?;
 
     let iframe_mappings: Vec<IframeMappingInfo> = snap
         .iframe_mappings
@@ -470,6 +663,7 @@ pub async fn snapshot(
         .collect();
 
     Ok(Json(ok(SnapshotResponse {
+        snapshot_id: snap.snapshot_id,
         url: snap.url,
         title: snap.title,
         nodes: snap.nodes,
@@ -478,21 +672,40 @@ pub async fn snapshot(
     })))
 }
 
+/// POST /snapshot/search - Search the latest snapshot without returning the full tree.
+pub async fn search_snapshot(
+    SessionEngine { engine, .. }: SessionEngine,
+    Json(req): Json<SnapshotSearchRequest>,
+) -> Result<Json<ApiSuccess<agent_browser_core::SnapshotSearchResult>>, (StatusCode, Json<ApiError>)>
+{
+    let result = engine
+        .search_snapshot(&req.query, req.max_results.unwrap_or(20).clamp(1, 200))
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ApiError::new("snapshot_search_failed", error)),
+            )
+        })?;
+    Ok(Json(ok(result)))
+}
+
 /// POST /act - Perform action on element
 pub async fn act(
     State(state): State<Arc<AppState>>,
+    SessionEngine { engine, session_id }: SessionEngine,
     Json(req): Json<ActRequest>,
-) -> Result<Json<ApiSuccess<ActionResult>>, (StatusCode, Json<ApiError>)> {
+) -> Result<Json<ApiSuccess<ActionResponse>>, (StatusCode, Json<ApiError>)> {
     info!("Act: {} on {}", req.action, req.ref_id);
 
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
-    let result = match req.action.as_str() {
-        "click" => engine.click(&req.ref_id).await,
-        "double_click" => engine.double_click(&req.ref_id).await,
-        "right_click" => engine.right_click(&req.ref_id).await,
-        "hover" => engine.hover(&req.ref_id).await,
-        "focus" => engine.focus(&req.ref_id).await,
+    let action = match req.action.as_str() {
+        "click" => ActionKind::Click,
+        "double_click" => ActionKind::DoubleClick,
+        "right_click" => ActionKind::RightClick,
+        "hover" => ActionKind::Hover,
+        "focus" => ActionKind::Focus,
         "type" => {
             let text = req.text.clone().ok_or_else(|| {
                 (
@@ -500,9 +713,10 @@ pub async fn act(
                     Json(ApiError::new("missing_param", "'text' required for type")),
                 )
             })?;
-            engine
-                .type_text(&req.ref_id, &text, req.clear_first.unwrap_or(false))
-                .await
+            ActionKind::Type {
+                text,
+                clear_first: req.clear_first,
+            }
         }
         "press" => {
             let key = req.key.clone().ok_or_else(|| {
@@ -511,7 +725,7 @@ pub async fn act(
                     Json(ApiError::new("missing_param", "'key' required for press")),
                 )
             })?;
-            engine.press(&req.ref_id, &key).await
+            ActionKind::Press { key }
         }
         "select" => {
             let values = req.values.clone().ok_or_else(|| {
@@ -523,7 +737,7 @@ pub async fn act(
                     )),
                 )
             })?;
-            engine.select(&req.ref_id, values).await
+            ActionKind::Select { values }
         }
         "drag" => {
             let target = req.target_ref_id.clone().ok_or_else(|| {
@@ -535,30 +749,17 @@ pub async fn act(
                     )),
                 )
             })?;
-            engine.drag(&req.ref_id, &target).await
+            ActionKind::Drag {
+                target_ref_id: target,
+            }
         }
-        "scroll" => {
-            let direction = req.direction.as_deref().unwrap_or("down");
-            engine.scroll(direction, req.amount.unwrap_or(300)).await
-        }
-        "wait" => {
-            let timeout = req.timeout_ms.unwrap_or(1000);
-            engine.wait(timeout).await.map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ApiError::new("wait_failed", e)),
-                )
-            })?;
-            emit_event(
-                &state,
-                "action",
-                serde_json::json!({"action": "wait", "timeout_ms": timeout}),
-            );
-            return Ok(Json(ok(ActionResult {
-                success: true,
-                message: format!("Waited {}ms", timeout),
-            })));
-        }
+        "scroll" => ActionKind::Scroll {
+            direction: Some(req.direction.clone().unwrap_or_else(|| "down".to_string())),
+            amount: Some(req.amount.unwrap_or(300)),
+        },
+        "wait" => ActionKind::Wait {
+            timeout_ms: Some(req.timeout_ms.unwrap_or(1000)),
+        },
         other => {
             return Err((
                 StatusCode::BAD_REQUEST,
@@ -570,14 +771,18 @@ pub async fn act(
         }
     };
 
-    let action_result = result.map_err(|e| {
-        (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(ApiError::new("action_failed", e)),
-        )
-    })?;
+    let action_result = engine
+        .act_with_snapshot(&req.snapshot_id, &req.ref_id, action)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ApiError::new("action_failed", e)),
+            )
+        })?;
     emit_event(
         &state,
+        &session_id,
         "action",
         serde_json::json!({
             "action": req.action,
@@ -585,15 +790,29 @@ pub async fn act(
             "success": action_result.success,
         }),
     );
-    Ok(Json(ok(action_result)))
+    let snapshot = engine
+        .snapshot_with_options(SnapshotOptions::default())
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiError::new("post_action_snapshot_failed", error)),
+            )
+        })?;
+    let diff = engine.latest_snapshot_diff().await;
+    Ok(Json(ok(ActionResponse {
+        action: action_result,
+        snapshot,
+        diff,
+    })))
 }
 
 /// GET /screenshot
 pub async fn screenshot(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Query(req): Query<ScreenshotQuery>,
 ) -> Result<Json<ApiSuccess<ScreenshotResponse>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let options = ScreenshotOptions {
         full_page: req.full_page,
@@ -618,11 +837,12 @@ pub async fn screenshot(
 /// POST /wait
 pub async fn wait(
     State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<WaitRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
     let timeout = req.timeout_ms.unwrap_or(state.config.default_timeout_ms);
 
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     if let Some(ref selector) = req.selector {
         engine
@@ -659,10 +879,10 @@ pub async fn wait(
 
 /// POST /evaluate
 pub async fn evaluate(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<EvaluateRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let value = engine.evaluate(&req.script).await.map_err(|e| {
         (
@@ -676,9 +896,9 @@ pub async fn evaluate(
 
 /// GET /cookies
 pub async fn get_cookies(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
 ) -> Result<Json<ApiSuccess<Vec<agent_browser_core::CookieInfo>>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let cookies = engine.get_cookies().await.map_err(|e| {
         (
@@ -692,10 +912,10 @@ pub async fn get_cookies(
 
 /// POST /cookies
 pub async fn set_cookies(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<SetCookiesRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     engine.set_cookies(req.cookies).await.map_err(|e| {
         (
@@ -709,9 +929,9 @@ pub async fn set_cookies(
 
 /// GET /tabs
 pub async fn list_tabs(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
 ) -> Result<Json<ApiSuccess<Vec<TabInfo>>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let tabs = engine.list_tabs().await.map_err(|e| {
         (
@@ -725,10 +945,10 @@ pub async fn list_tabs(
 
 /// POST /tabs/{tab_id}/activate
 pub async fn activate_tab(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Path(tab_id): Path<String>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     engine.activate_tab(&tab_id).await.map_err(|e| {
         (
@@ -742,10 +962,10 @@ pub async fn activate_tab(
 
 /// DELETE /tabs/{tab_id}
 pub async fn close_tab(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Path(tab_id): Path<String>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     engine.close_tab(&tab_id).await.map_err(|e| {
         (
@@ -761,14 +981,15 @@ pub async fn close_tab(
 /// POST /upload
 pub async fn upload(
     State(state): State<Arc<AppState>>,
+    SessionEngine { engine, session_id }: SessionEngine,
     Json(req): Json<UploadRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
     info!("Upload: {} -> ref_id={}", req.file_path, req.ref_id);
 
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     engine
-        .upload_file(&req.ref_id, &req.file_path)
+        .upload_file_with_snapshot(&req.snapshot_id, &req.ref_id, &req.file_path)
         .await
         .map_err(|e| {
             (
@@ -779,6 +1000,7 @@ pub async fn upload(
 
     emit_event(
         &state,
+        &session_id,
         "upload",
         serde_json::json!({"file": &req.file_path, "ref_id": &req.ref_id}),
     );
@@ -788,10 +1010,10 @@ pub async fn upload(
 
 /// POST /dialog
 pub async fn dialog(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<DialogRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     engine
         .setup_dialog_handler(req.accept, req.prompt_text)
@@ -809,8 +1031,9 @@ pub async fn dialog(
 /// POST /shutdown
 pub async fn shutdown(
     State(state): State<Arc<AppState>>,
+    SessionEngine { engine, session_id }: SessionEngine,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     engine.shutdown().await.map_err(|e| {
         (
@@ -819,7 +1042,7 @@ pub async fn shutdown(
         )
     })?;
 
-    emit_event(&state, "shutdown", serde_json::json!({}));
+    emit_event(&state, &session_id, "shutdown", serde_json::json!({}));
 
     Ok(Json(ok_empty()))
 }
@@ -830,25 +1053,31 @@ pub async fn shutdown(
 
 #[derive(Debug, Deserialize)]
 pub struct EnterIframeRequest {
+    pub snapshot_id: String,
     pub ref_id: String,
 }
 
 /// POST /iframe/enter
 pub async fn enter_iframe(
     State(state): State<Arc<AppState>>,
+    SessionEngine { engine, session_id }: SessionEngine,
     Json(req): Json<EnterIframeRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
-    let depth = engine.enter_iframe(&req.ref_id).await.map_err(|e| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ApiError::new("iframe_not_found", e)),
-        )
-    })?;
+    let depth = engine
+        .enter_iframe_with_snapshot(&req.snapshot_id, &req.ref_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ApiError::new("iframe_not_found", e)),
+            )
+        })?;
 
     emit_event(
         &state,
+        &session_id,
         "iframe_entered",
         serde_json::json!({"depth": depth, "ref_id": &req.ref_id}),
     );
@@ -861,8 +1090,9 @@ pub async fn enter_iframe(
 /// POST /iframe/exit
 pub async fn exit_iframe(
     State(state): State<Arc<AppState>>,
+    SessionEngine { engine, session_id }: SessionEngine,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let depth = engine.exit_iframe().await.map_err(|e| {
         (
@@ -871,7 +1101,12 @@ pub async fn exit_iframe(
         )
     })?;
 
-    emit_event(&state, "iframe_exited", serde_json::json!({"depth": depth}));
+    emit_event(
+        &state,
+        &session_id,
+        "iframe_exited",
+        serde_json::json!({"depth": depth}),
+    );
 
     Ok(Json(ok(serde_json::json!({ "depth": depth }))))
 }
@@ -879,8 +1114,9 @@ pub async fn exit_iframe(
 /// POST /iframe/exit-all
 pub async fn exit_all_iframes(
     State(state): State<Arc<AppState>>,
+    SessionEngine { engine, session_id }: SessionEngine,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     engine.exit_all_iframes().await.map_err(|e| {
         (
@@ -889,7 +1125,12 @@ pub async fn exit_all_iframes(
         )
     })?;
 
-    emit_event(&state, "iframe_exited_all", serde_json::json!({"depth": 0}));
+    emit_event(
+        &state,
+        &session_id,
+        "iframe_exited_all",
+        serde_json::json!({"depth": 0}),
+    );
 
     Ok(Json(ok(serde_json::json!({ "depth": 0 }))))
 }
@@ -909,6 +1150,7 @@ pub struct DownloadFileRequest {
 
 #[derive(Debug, Deserialize)]
 pub struct ClickDownloadRequest {
+    pub snapshot_id: String,
     pub ref_id: String,
     #[serde(default)]
     pub save_path: Option<String>,
@@ -919,9 +1161,10 @@ pub struct ClickDownloadRequest {
 /// POST /download
 pub async fn download_file(
     State(state): State<Arc<AppState>>,
+    SessionEngine { engine, session_id }: SessionEngine,
     Json(req): Json<DownloadFileRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let options = agent_browser_core::DownloadOptions {
         save_path: req.save_path,
@@ -940,6 +1183,7 @@ pub async fn download_file(
 
     emit_event(
         &state,
+        &session_id,
         "download",
         serde_json::json!({
             "guid": &result.guid,
@@ -961,9 +1205,10 @@ pub async fn download_file(
 /// POST /click-download
 pub async fn click_and_download(
     State(state): State<Arc<AppState>>,
+    SessionEngine { engine, session_id }: SessionEngine,
     Json(req): Json<ClickDownloadRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let options = agent_browser_core::DownloadOptions {
         save_path: req.save_path,
@@ -971,7 +1216,7 @@ pub async fn click_and_download(
     };
 
     let result = engine
-        .click_and_download(&req.ref_id, Some(options))
+        .click_and_download_with_snapshot(&req.snapshot_id, &req.ref_id, Some(options))
         .await
         .map_err(|e| {
             (
@@ -982,6 +1227,7 @@ pub async fn click_and_download(
 
     emit_event(
         &state,
+        &session_id,
         "download",
         serde_json::json!({
             "guid": &result.guid,
@@ -1018,10 +1264,10 @@ pub struct ShortcutRequest {
 
 /// POST /press-key
 pub async fn press_key(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<PressKeyRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let modifiers: Vec<agent_browser_core::KeyModifier> = req
         .modifiers
@@ -1053,10 +1299,10 @@ pub async fn press_key(
 
 /// POST /shortcut
 pub async fn send_shortcut(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<ShortcutRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let result = engine.send_shortcut(&req.shortcut).await.map_err(|e| {
         (
@@ -1078,10 +1324,10 @@ pub async fn send_shortcut(
 /// POST /click-selector
 /// Click an element by CSS selector directly (without needing ref_id)
 pub async fn click_selector(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<SelectorRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let result = engine
         .click_selector(&req.selector, req.timeout_ms)
@@ -1102,10 +1348,10 @@ pub async fn click_selector(
 /// POST /type-selector
 /// Type text into an element by CSS selector
 pub async fn type_selector(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<TypeSelectorRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let result = engine
         .type_selector(
@@ -1126,10 +1372,10 @@ pub async fn type_selector(
 /// POST /get-text
 /// Get text content of an element by CSS selector
 pub async fn get_text(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<SelectorRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let text = engine
         .get_text(&req.selector, req.timeout_ms)
@@ -1150,10 +1396,10 @@ pub async fn get_text(
 /// POST /get-attribute
 /// Get an attribute value of an element by CSS selector
 pub async fn get_attribute(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<GetAttributeRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let value = engine
         .get_attribute(&req.selector, &req.attribute, req.timeout_ms)
@@ -1175,10 +1421,10 @@ pub async fn get_attribute(
 /// POST /element-exists
 /// Check if an element exists by CSS selector
 pub async fn element_exists(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<SelectorRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let exists = engine.element_exists(&req.selector).await.map_err(|e| {
         (
@@ -1196,10 +1442,10 @@ pub async fn element_exists(
 /// POST /hover
 /// Hover over an element by CSS selector
 pub async fn hover_selector(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<SelectorRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let result = engine
         .hover_selector(&req.selector, req.timeout_ms)
@@ -1220,10 +1466,10 @@ pub async fn hover_selector(
 /// POST /select-option
 /// Select an option in a select element by CSS selector
 pub async fn select_option(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<SelectOptionRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let result = engine
         .select_option(
@@ -1249,10 +1495,10 @@ pub async fn select_option(
 /// POST /submenu
 /// Expand a menu and click a submenu item
 pub async fn expand_and_click_submenu(
-    State(state): State<Arc<AppState>>,
+    SessionEngine { engine, .. }: SessionEngine,
     Json(req): Json<SubmenuRequest>,
 ) -> Result<Json<ApiSuccess<serde_json::Value>>, (StatusCode, Json<ApiError>)> {
-    let engine = &state.engine;
+    let engine = engine.as_ref();
 
     let result = engine
         .expand_and_click_submenu(&req.menu_selector, &req.submenu_selector, req.timeout_ms)
@@ -1271,9 +1517,9 @@ pub async fn expand_and_click_submenu(
 }
 
 /// GET /health
-pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let launched = state.engine.is_launched().await;
-    let responsive = !launched || state.engine.health_check().await;
+pub async fn health(SessionEngine { engine, .. }: SessionEngine) -> impl IntoResponse {
+    let launched = engine.is_launched().await;
+    let responsive = !launched || engine.health_check().await;
     let status = if responsive {
         StatusCode::OK
     } else {
@@ -1303,11 +1549,12 @@ pub type EventBroadcast = Arc<broadcast::Sender<serde_json::Value>>;
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
+    SessionEngine { session_id, .. }: SessionEngine,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws(socket, state))
+    ws.on_upgrade(move |socket| handle_ws(socket, state, session_id))
 }
 
-async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
+async fn handle_ws(socket: WebSocket, state: Arc<AppState>, session_id: String) {
     let mut rx = state.event_tx.subscribe();
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -1321,6 +1568,9 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
             ev = rx.recv() => {
                 match ev {
                     Ok(event) => {
+                        if !event_belongs_to_session(&event, &session_id) {
+                            continue;
+                        }
                         let msg = serde_json::to_string(&event).unwrap_or_default();
                         if ws_tx.send(Message::Text(msg)).await.is_err() { break; }
                     }
@@ -1355,14 +1605,21 @@ async fn handle_ws(socket: WebSocket, state: Arc<AppState>) {
     }
 }
 
+fn event_belongs_to_session(event: &serde_json::Value, session_id: &str) -> bool {
+    event.get("session_id").and_then(serde_json::Value::as_str) == Some(session_id)
+}
+
 // ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/sessions", post(create_session).get(list_sessions))
+        .route("/sessions/{session_id}", delete(delete_session))
         .route("/navigate", post(navigate))
         .route("/snapshot", get(snapshot))
+        .route("/snapshot/search", post(search_snapshot))
         .route("/act", post(act))
         .route("/screenshot", get(screenshot))
         .route("/wait", post(wait))
@@ -1418,7 +1675,13 @@ pub async fn run_server(config: HttpConfig) -> anyhow::Result<()> {
         engine: Arc::new(engine),
         config: config.clone(),
         event_tx,
+        sessions: RwLock::new(std::collections::HashMap::new()),
     });
+    forward_browser_events(
+        state.engine.clone(),
+        state.event_tx.clone(),
+        "default".to_string(),
+    );
 
     // Build router
     let app = build_router(state);
@@ -1434,12 +1697,15 @@ pub async fn run_server(config: HttpConfig) -> anyhow::Result<()> {
 
 /// Parse configuration from environment
 pub fn config_from_env() -> HttpConfig {
-    let mut config = HttpConfig::default();
+    let mut config = HttpConfig {
+        browser: BrowserConfig::from_env(),
+        ..HttpConfig::default()
+    };
 
-    if let Ok(host) = std::env::var("BROWSER_HTTP_HOST") {
-        if let Ok(host) = host.parse() {
-            config.host = host;
-        }
+    if let Ok(host) = std::env::var("BROWSER_HTTP_HOST")
+        && let Ok(host) = host.parse()
+    {
+        config.host = host;
     }
 
     if let Ok(port) = std::env::var("BROWSER_HTTP_PORT") {
@@ -1454,18 +1720,6 @@ pub fn config_from_env() -> HttpConfig {
 
     if let Ok(timeout) = std::env::var("BROWSER_DEFAULT_TIMEOUT_MS") {
         config.default_timeout_ms = timeout.parse().unwrap_or(30_000);
-    }
-
-    if let Ok(headless) = std::env::var("BROWSER_HEADLESS") {
-        config.browser.headless = match headless.to_ascii_lowercase().as_str() {
-            "0" | "false" | "no" => HeadlessMode::None,
-            "old" => HeadlessMode::Old,
-            _ => HeadlessMode::New,
-        };
-    }
-
-    if let Some(roots) = std::env::var_os("BROWSER_ALLOWED_FILE_ROOTS") {
-        config.browser.allowed_file_roots = std::env::split_paths(&roots).collect();
     }
 
     config
@@ -1520,5 +1774,39 @@ mod tests {
             NavigationWaitUntil::None
         );
         assert!(parse_wait_until(Some("networkidle0")).is_err());
+    }
+
+    #[tokio::test]
+    async fn creates_lists_and_deletes_isolated_sessions() {
+        let config = HttpConfig::default();
+        let (event_tx, _) = broadcast::channel(16);
+        let state = Arc::new(AppState {
+            engine: Arc::new(BrowserEngine::new(config.browser.clone())),
+            config,
+            event_tx: Arc::new(event_tx),
+            sessions: RwLock::new(std::collections::HashMap::new()),
+        });
+
+        let created = create_session(State(state.clone())).await.0.data.unwrap();
+        let listed = list_sessions(State(state.clone())).await.0.data.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].session_id, created.session_id);
+
+        let status = delete_session(State(state.clone()), Path(created.session_id))
+            .await
+            .unwrap();
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert!(state.sessions.read().await.is_empty());
+    }
+
+    #[test]
+    fn websocket_events_are_session_scoped() {
+        let event = serde_json::json!({"session_id": "session-a", "type": "action"});
+        assert!(event_belongs_to_session(&event, "session-a"));
+        assert!(!event_belongs_to_session(&event, "session-b"));
+        assert!(!event_belongs_to_session(
+            &serde_json::json!({"type": "action"}),
+            "session-a"
+        ));
     }
 }

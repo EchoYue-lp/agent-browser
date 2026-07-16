@@ -205,6 +205,8 @@ pub struct ServerCapabilities {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completions: Option<CompletionsCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tasks: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub experimental: Option<Value>,
 }
 
@@ -263,6 +265,15 @@ pub struct Tool {
     pub output_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<ToolAnnotations>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ToolExecution>,
+}
+
+/// Declares whether a tool can be executed as an MCP task.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolExecution {
+    pub task_support: String,
 }
 
 /// 工具行为注解（2025-11-25 新增）
@@ -293,6 +304,46 @@ pub struct ToolCallParams {
     pub name: String,
     #[serde(default)]
     pub arguments: Option<Value>,
+    #[serde(rename = "_meta", default)]
+    pub meta: Option<RequestMeta>,
+    #[serde(default)]
+    pub task: Option<TaskRequest>,
+}
+
+/// Optional request metadata used for progress reporting.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct RequestMeta {
+    #[serde(rename = "progressToken", default)]
+    pub progress_token: Option<Value>,
+}
+
+/// Request asynchronous execution for a task-capable tool.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct TaskRequest {
+    #[serde(default)]
+    pub ttl: Option<u64>,
+}
+
+/// MCP task descriptor.
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskDescriptor {
+    pub task_id: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_message: Option<String>,
+    pub created_at: String,
+    pub last_updated_at: String,
+    pub ttl: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub poll_interval: Option<u64>,
+}
+
+/// Parameters shared by task lookup, result and cancellation methods.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskIdParams {
+    pub task_id: String,
 }
 
 /// tools/call 响应结果

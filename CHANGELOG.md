@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-16
+
+### Added
+
+- Snapshot-bound actions with stale reference rejection, compact snapshots, search, and diffs.
+- Origin allow/block policies, private-network protection, file-root enforcement, and sensitive network data redaction.
+- Trusted CDP pointer/text input with visibility, stability, hit-target, enabled, and editable checks.
+- Isolated HTTP browser sessions, lifecycle events, crash recovery, and idempotent monitoring setup.
+- MCP structured outputs, capability allowlists, progress notifications, request cancellation, and durable tasks.
+- Browser E2E coverage for the complete snapshot/action/recovery workflow.
+
+### Changed
+
+- Chrome sandboxing now stays enabled unless `no_sandbox`/`BROWSER_NO_SANDBOX` is explicitly set.
+- MCP and HTTP ref-based actions now require the `snapshot_id` that produced each `ref_id`.
+- Browser configuration is consistently loaded from `BROWSER_*` environment variables.
+- Upgraded `chromiumoxide` to `0.9.1`.
+- Raised the minimum supported Rust version to 1.88.
+
+### Fixed
+
+- Browser handler termination is detected and a later operation launches a fresh browser process.
+- Repeated network/console monitoring no longer registers duplicate listeners.
+- Missing optional MCP arguments no longer panic.
+- `clear_first` uses native text insertion instead of sending an invalid `Control+a` key name.
+
 ## [0.2.0] - 2025-04-07
 
 ### Added

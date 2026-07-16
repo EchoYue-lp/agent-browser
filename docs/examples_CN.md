@@ -213,7 +213,7 @@ curl -X POST http://localhost:3000/wait \
 # 向下滚动
 curl -X POST http://localhost:3000/act \
   -H "Content-Type: application/json" \
-  -d '{"ref_id": "ax1", "action": "scroll", "direction": "down", "amount": 500}'
+  -d '{"snapshot_id": "SNAPSHOT_ID", "ref_id": "", "action": "scroll", "direction": "down", "amount": 500}'
 
 # 或使用 JavaScript 进行无限滚动
 curl -X POST http://localhost:3000/evaluate \

@@ -35,7 +35,7 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use agent_browser_core::{BrowserEngine, BrowserConfig};
+//! use agent_browser_core::{ActionKind, BrowserEngine, BrowserConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {
@@ -50,8 +50,10 @@
 //!     println!("Page title: {}", snapshot.title);
 //!     println!("Element count: {}", snapshot.nodes.len());
 //!
-//!     // Method 1: Click element using ref_id
-//!     engine.click("ax1").await?;
+//!     // Method 1: Bind ref-based actions to their source snapshot
+//!     engine
+//!         .act_with_snapshot(&snapshot.snapshot_id, "ax1", ActionKind::Click)
+//!         .await?;
 //!
 //!     // Method 2: Use CSS selector directly (recommended)
 //!     engine.click_selector("button.submit", None).await?;
@@ -76,7 +78,6 @@
 //!     .with_headless(HeadlessMode::New)  // New headless mode, harder to detect
 //!     .with_stealth(true);                // Inject anti-detection scripts
 //!
-//! # fn main() {}
 //! ```
 //!
 //! ## CSS Selector Operations
@@ -123,10 +124,13 @@ pub mod types;
 pub use actions::{ActionKind, ActionResult};
 pub use browser::{BrowserEngine, BrowserHandle, IframeContext};
 pub use error::{Error, Result};
-pub use snapshot::{PageSnapshot, SnapshotNode};
+pub use snapshot::{
+    PageSnapshot, SnapshotDiff, SnapshotNode, SnapshotNodeSummary, SnapshotOptions,
+    SnapshotSearchResult,
+};
 pub use types::{
-    Bounds, BrowserConfig, ConsoleMessage, CookieInfo, DownloadOptions, DownloadResult,
-    DownloadStatus, HeadlessMode, KeyModifier, NavigateResult, NavigationWaitUntil, NetworkRequest,
-    NetworkResponse, PageInfo, PressOptions, ScreenshotOptions, ScreenshotResult, SetCookieParam,
-    TabInfo, ToolResult, ViewportSize, WaitOptions,
+    Bounds, BrowserConfig, BrowserEvent, ConsoleMessage, CookieInfo, DownloadOptions,
+    DownloadResult, DownloadStatus, HeadlessMode, KeyModifier, NavigateResult, NavigationWaitUntil,
+    NetworkRequest, NetworkResponse, PageInfo, PressOptions, ScreenshotOptions, ScreenshotResult,
+    SetCookieParam, TabInfo, ToolResult, ViewportSize, WaitOptions,
 };

@@ -4,7 +4,7 @@
 [![Crates.io](https://img.shields.io/crates/v/agent-browser.svg)](https://crates.io/crates/agent-browser)
 [![Docs.rs](https://docs.rs/agent-browser/badge.svg)](https://docs.rs/agent-browser)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 
 **专为 AI Agent 设计的浏览器自动化工具集。**
 
@@ -35,7 +35,7 @@ cargo build --release
 
 ### 前置要求
 
-- Rust 1.85+
+- Rust 1.88+
 - Chrome 或 Chromium 浏览器（自动检测）
 
 ## 🚀 快速开始
@@ -89,7 +89,7 @@ curl "http://localhost:3000/screenshot?full_page=true" | jq -r '.data.image' | b
 直接在你的 Rust 项目中使用：
 
 ```rust
-use agent_browser_core::{BrowserEngine, BrowserConfig};
+use agent_browser_core::{ActionKind, BrowserEngine, BrowserConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -99,8 +99,10 @@ async fn main() -> anyhow::Result<()> {
     let snapshot = engine.snapshot().await?;
     println!("标题: {}", snapshot.title);
 
-    // 使用 ref_id 点击
-    engine.click("ax1").await?;
+    // 将操作绑定到生成 ref_id 的快照
+    engine
+        .act_with_snapshot(&snapshot.snapshot_id, "ax1", ActionKind::Click)
+        .await?;
 
     // 或直接使用 CSS 选择器（推荐）
     engine.click_selector("button.submit", None).await?;
@@ -128,6 +130,7 @@ Agent Browser 实现了 [MCP 2025-11-25](https://modelcontextprotocol.io/specifi
 | **Resources** | 截图和快照作为资源访问 |
 | **Prompts** | 预定义提示词用于常见任务 |
 | **Logging** | 可配置的日志级别 |
+| **Tasks** | 持久执行、轮询、结果获取和取消 |
 
 ### 传输层
 
@@ -154,9 +157,9 @@ Agent Browser 实现了 [MCP 2025-11-25](https://modelcontextprotocol.io/specifi
 
 | 工具 | 描述 | 注解 |
 |------|------|------|
-| `browser_click` | 点击元素（by ref_id） | - |
-| `browser_type` | 输入文本 | - |
-| `browser_press` | 按键 | - |
+| `browser_click` | 使用 `snapshot_id` + `ref_id` 点击 | - |
+| `browser_type` | 使用 `snapshot_id` + `ref_id` 输入 | - |
+| `browser_press` | 使用 `snapshot_id` + `ref_id` 按键 | - |
 | `browser_press_key` | 带修饰键按键 | - |
 | `browser_shortcut` | 发送快捷键 | - |
 | `browser_scroll` | 滚动页面 | `idempotentHint: true` |
@@ -237,8 +240,11 @@ Agent Browser 实现了 [MCP 2025-11-25](https://modelcontextprotocol.io/specifi
 | 端点 | 方法 | 描述 |
 |------|------|------|
 | `/navigate` | POST | 导航到 URL |
-| `/snapshot` | GET | 获取 Accessibility Tree |
-| `/act` | POST | 执行元素操作 |
+| `/snapshot` | GET | 获取紧凑 Accessibility Tree 和 `snapshot_id` |
+| `/snapshot/search` | POST | 搜索最近快照 |
+| `/act` | POST | 执行快照绑定的元素操作 |
+| `/sessions` | POST/GET | 创建或列出隔离浏览器会话 |
+| `/sessions/{id}` | DELETE | 关闭隔离会话 |
 | `/screenshot` | GET | 截图 |
 | `/wait` | POST | 等待选择器/超时 |
 | `/evaluate` | POST | 执行 JavaScript |
@@ -276,12 +282,19 @@ Agent Browser 实现了 [MCP 2025-11-25](https://modelcontextprotocol.io/specifi
 BROWSER_HTTP_HOST=127.0.0.1   # 监听地址（默认仅本机回环）
 BROWSER_HTTP_PORT=8080         # 服务端口（默认：3000）
 BROWSER_HEADLESS=1             # 启用无头模式
+BROWSER_NO_SANDBOX=false       # 仅在必要时显式禁用 Chrome 沙箱
 BROWSER_API_KEY=secret123      # API 密钥认证
 BROWSER_DEFAULT_TIMEOUT_MS=60000  # 默认超时时间（毫秒）
 BROWSER_ALLOWED_FILE_ROOTS=/tmp:/path/to/workspace  # 上传/下载允许目录
+BROWSER_ALLOWED_ORIGINS=https://example.com,https://*.example.org
+BROWSER_BLOCKED_ORIGINS=https://admin.example.com
+BROWSER_ALLOW_PRIVATE_NETWORKS=false  # 默认阻止回环、私网和链路本地目标
+BROWSER_CAPTURE_SENSITIVE_DATA=false  # 默认脱敏认证头、Cookie 和请求体
+BROWSER_MCP_CAPS=network,storage,files,devtools  # 可选 MCP 能力白名单
 ```
 
 监听非回环地址时必须配置 `BROWSER_API_KEY`。
+HTTP 客户端可通过 `X-Browser-Session` Header 选择隔离会话。
 
 ### Rust 配置
 

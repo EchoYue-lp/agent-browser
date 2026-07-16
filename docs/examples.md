@@ -213,7 +213,7 @@ curl -X POST http://localhost:3000/wait \
 # Scroll down
 curl -X POST http://localhost:3000/act \
   -H "Content-Type: application/json" \
-  -d '{"ref_id": "ax1", "action": "scroll", "direction": "down", "amount": 500}'
+  -d '{"snapshot_id": "SNAPSHOT_ID", "ref_id": "", "action": "scroll", "direction": "down", "amount": 500}'
 
 # Or use JavaScript for infinite scroll
 curl -X POST http://localhost:3000/evaluate \

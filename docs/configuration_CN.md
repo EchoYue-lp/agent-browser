@@ -16,7 +16,13 @@ Agent Browser 的详细配置选项。
 | `navigation_timeout_ms` | `u64` | `30000` | 导航超时时间（毫秒） |
 | `action_timeout_ms` | `u64` | `10000` | 操作超时时间（毫秒） |
 | `stealth` | `bool` | `true` | 启用反检测脚本 |
+| `no_sandbox` | `bool` | `false` | 显式添加 Chrome `--no-sandbox` 参数 |
 | `extra_args` | `Vec<String>` | `[]` | 额外的 Chrome 启动参数 |
+| `allowed_file_roots` | `Vec<PathBuf>` | 当前目录和临时目录 | 上传/下载文件系统边界 |
+| `allowed_origins` | `Vec<String>` | `[]` | 可选的精确/通配 Origin 白名单 |
+| `blocked_origins` | `Vec<String>` | `[]` | 优先匹配的 Origin 黑名单 |
+| `allow_private_networks` | `bool` | `false` | 是否允许回环、私网和链路本地地址 |
+| `capture_sensitive_data` | `bool` | `false` | 网络监控中是否保留认证头和请求体 |
 
 ### HeadlessMode
 
@@ -48,6 +54,15 @@ let config = BrowserConfig::default()
 
     // 启用/禁用反检测
     .with_stealth(true)
+
+    // 除非运行环境无法支持，否则保持 Chrome 沙箱开启
+    .with_no_sandbox(false)
+
+    // 限制浏览器网络和文件系统访问
+    .with_allowed_origins(["https://example.com", "https://*.example.org"])
+    .with_blocked_origins(["https://admin.example.com"])
+    .with_private_networks(false)
+    .with_allowed_file_roots(["/tmp/agent-browser"])
 
     // 添加 Chrome 参数
     .with_arg("--disable-web-security")
@@ -83,9 +98,18 @@ let config = BrowserConfig::headless_old();
 | `BROWSER_HTTP_HOST` | 监听地址；非回环地址必须配置 API Key | `127.0.0.1` |
 | `BROWSER_HTTP_PORT` | 服务器端口 | `3000` |
 | `BROWSER_HEADLESS` | `false` 为有头，`old` 为旧无头，其他值为新无头 | 新无头 |
+| `BROWSER_STEALTH` | 是否启用 stealth 脚本 | `true` |
+| `BROWSER_NO_SANDBOX` | 显式禁用 Chrome 沙箱 | `false` |
 | `BROWSER_API_KEY` | API 认证密钥 | - |
 | `BROWSER_DEFAULT_TIMEOUT_MS` | 默认超时时间（毫秒） | `30000` |
 | `BROWSER_ALLOWED_FILE_ROOTS` | 按平台路径分隔符连接的上传/下载允许目录 | 当前目录和临时目录 |
+| `BROWSER_ALLOWED_ORIGINS` | 逗号分隔的精确/通配 Origin 白名单 | 不限制公网 Origin |
+| `BROWSER_BLOCKED_ORIGINS` | 逗号分隔的 Origin 黑名单 | - |
+| `BROWSER_ALLOW_PRIVATE_NETWORKS` | 允许回环、私网和链路本地目标 | `false` |
+| `BROWSER_CAPTURE_SENSITIVE_DATA` | 在网络日志中保留凭证和请求体 | `false` |
+| `BROWSER_NAVIGATION_TIMEOUT_MS` | 导航超时 | `30000` |
+| `BROWSER_ACTION_TIMEOUT_MS` | 可操作性等待超时 | `10000` |
+| `BROWSER_MCP_CAPS` | MCP 能力白名单（`network,storage,files,devtools`） | 全部 |
 
 ### 示例
 
@@ -93,8 +117,10 @@ let config = BrowserConfig::headless_old();
 # 使用自定义设置启动 HTTP 服务器
 BROWSER_HTTP_PORT=8080 \
 BROWSER_HEADLESS=1 \
+BROWSER_NO_SANDBOX=false \
 BROWSER_API_KEY=secret123 \
 BROWSER_ALLOWED_FILE_ROOTS=/tmp:/path/to/workspace \
+BROWSER_ALLOWED_ORIGINS=https://example.com,https://*.example.org \
 BROWSER_DEFAULT_TIMEOUT_MS=60000 \
 ./target/release/agent-browser-http
 ```
@@ -109,7 +135,7 @@ BROWSER_DEFAULT_TIMEOUT_MS=60000 \
 | `--disable-features=IsolateOrigins,site-per-process` | 禁用站点隔离 |
 | `--window-size=WIDTH,HEIGHT` | 设置窗口大小 |
 | `--disable-gpu` | 禁用 GPU 硬件加速 |
-| `--no-sandbox` | 禁用沙箱（某些环境需要） |
+| `--no-sandbox` | 禁用沙箱；仅在运行环境无法支持 Chrome 沙箱时使用 |
 | `--disable-setuid-sandbox` | 禁用 setuid 沙箱 |
 | `--disable-dev-shm-usage` | 使用 /tmp 替代 /dev/shm |
 | `--disable-blink-features=AutomationControlled` | 隐藏自动化指示器 |
@@ -254,7 +280,9 @@ let config = BrowserConfig::headed()
 ```rust
 let config = BrowserConfig::headless()
     .with_stealth(true)
-    .with_arg("--no-sandbox")
+    .with_no_sandbox(true)
     .with_arg("--disable-setuid-sandbox")
     .with_arg("--disable-dev-shm-usage");
 ```
+
+`with_no_sandbox(true)` 会削弱进程隔离，应优先使用支持 Chrome 沙箱的容器或运行环境。

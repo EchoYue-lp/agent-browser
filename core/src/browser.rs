@@ -12,20 +12,25 @@
 //! - Keyboard shortcuts
 
 use chromiumoxide::{Browser, Page, browser::BrowserConfig as ChromeConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, broadcast};
 use tracing::{debug, info, warn};
+use url::Url;
 
 use crate::actions::{ActionKind, ActionResult};
 use crate::error::{Error, Result};
 use crate::snapshot;
-use crate::snapshot::PageSnapshot;
+use crate::snapshot::{PageSnapshot, SnapshotDiff, SnapshotOptions, SnapshotSearchResult};
 use crate::types::{
-    BrowserConfig, CookieInfo, DownloadOptions, DownloadResult, DownloadStatus, HeadlessMode,
-    KeyModifier, NavigationWaitUntil, ScreenshotOptions, SetCookieParam, TabInfo,
+    BrowserConfig, BrowserEvent, CookieInfo, DownloadOptions, DownloadResult, DownloadStatus,
+    HeadlessMode, KeyModifier, NavigationWaitUntil, ScreenshotOptions, SetCookieParam, TabInfo,
 };
 
 /// Validate a file path for security.
@@ -115,6 +120,209 @@ fn ensure_path_allowed(path: &Path, allowed_roots: &[PathBuf]) -> Result<()> {
     }
 }
 
+fn origin_matches(pattern: &str, url: &Url) -> bool {
+    let pattern = pattern.trim().trim_end_matches('/');
+    if pattern == "*" {
+        return true;
+    }
+
+    let origin = url.origin().ascii_serialization();
+    if pattern.eq_ignore_ascii_case(&origin) {
+        return true;
+    }
+
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.to_ascii_lowercase();
+    let (pattern_scheme, authority) = pattern
+        .split_once("://")
+        .map_or((None, pattern), |(scheme, authority)| {
+            (Some(scheme), authority)
+        });
+    if pattern_scheme.is_some_and(|scheme| !scheme.eq_ignore_ascii_case(url.scheme())) {
+        return false;
+    }
+
+    let authority = authority.split('/').next().unwrap_or(authority);
+    let (pattern_host, pattern_port) = authority
+        .rsplit_once(':')
+        .and_then(|(host, port)| port.parse::<u16>().ok().map(|port| (host, Some(port))))
+        .unwrap_or((authority, None));
+    if let Some(port) = pattern_port {
+        if url.port_or_known_default() != Some(port) {
+            return false;
+        }
+    } else if pattern_scheme.is_some()
+        && url.port().is_some()
+        && url.port_or_known_default()
+            != match url.scheme() {
+                "http" | "ws" => Some(80),
+                "https" | "wss" => Some(443),
+                _ => None,
+            }
+    {
+        return false;
+    }
+    let pattern_host = pattern_host.to_ascii_lowercase();
+
+    pattern_host
+        .strip_prefix("*.")
+        .is_some_and(|suffix| host.ends_with(&format!(".{suffix}")))
+}
+
+fn is_restricted_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.octets()[0] == 0
+                || matches!(ip.octets(), [100, second, _, _] if (64..=127).contains(&second))
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+        }
+    }
+}
+
+async fn validate_url_policy(
+    config: &BrowserConfig,
+    cache: &Mutex<HashMap<String, (bool, Instant)>>,
+    raw_url: &str,
+) -> Result<Url> {
+    let url = Url::parse(raw_url)
+        .map_err(|error| Error::InvalidParameter(format!("Invalid URL: {error}")))?;
+    if matches!(url.scheme(), "about" | "blob" | "data") {
+        return Ok(url);
+    }
+    if !matches!(url.scheme(), "http" | "https" | "ws" | "wss") {
+        return Err(Error::NetworkAccessDenied(format!(
+            "Unsupported URL scheme: {}",
+            url.scheme()
+        )));
+    }
+
+    if config
+        .blocked_origins
+        .iter()
+        .any(|pattern| origin_matches(pattern, &url))
+    {
+        return Err(Error::NetworkAccessDenied(format!(
+            "Origin is blocked: {}",
+            url.origin().ascii_serialization()
+        )));
+    }
+    if !config.allowed_origins.is_empty()
+        && !config
+            .allowed_origins
+            .iter()
+            .any(|pattern| origin_matches(pattern, &url))
+    {
+        return Err(Error::NetworkAccessDenied(format!(
+            "Origin is not allowlisted: {}",
+            url.origin().ascii_serialization()
+        )));
+    }
+
+    if config.allow_private_networks {
+        return Ok(url);
+    }
+
+    let host = url
+        .host_str()
+        .ok_or_else(|| Error::NetworkAccessDenied("URL has no host".to_string()))?;
+    if let Some((allowed, checked_at)) = cache.lock().await.get(host).copied()
+        && checked_at.elapsed() < Duration::from_secs(5)
+    {
+        return if allowed {
+            Ok(url)
+        } else {
+            Err(Error::NetworkAccessDenied(format!(
+                "Host resolves to a private or local network: {host}"
+            )))
+        };
+    }
+
+    let allowed = if let Ok(ip) = host.parse::<IpAddr>() {
+        !is_restricted_ip(ip)
+    } else {
+        let port = url.port_or_known_default().unwrap_or(443);
+        let resolved = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|error| {
+                Error::NetworkAccessDenied(format!("Failed to resolve host {host}: {error}"))
+            })?
+            .collect::<Vec<_>>();
+        !resolved.is_empty() && resolved.iter().all(|addr| !is_restricted_ip(addr.ip()))
+    };
+    cache
+        .lock()
+        .await
+        .insert(host.to_string(), (allowed, Instant::now()));
+
+    if allowed {
+        Ok(url)
+    } else {
+        Err(Error::NetworkAccessDenied(format!(
+            "Host resolves to a private or local network: {host}"
+        )))
+    }
+}
+
+fn sanitize_headers(
+    mut headers: serde_json::Value,
+    capture_sensitive_data: bool,
+) -> serde_json::Value {
+    if capture_sensitive_data {
+        return headers;
+    }
+    if let Some(object) = headers.as_object_mut() {
+        for (name, value) in object {
+            if matches!(
+                name.to_ascii_lowercase().as_str(),
+                "authorization"
+                    | "proxy-authorization"
+                    | "cookie"
+                    | "set-cookie"
+                    | "x-api-key"
+                    | "x-auth-token"
+            ) {
+                *value = serde_json::Value::String("<redacted>".to_string());
+            }
+        }
+    }
+    headers
+}
+
+fn wildcard_match(pattern: &str, value: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    let mut remaining = value;
+    let mut first = true;
+    for part in pattern.split('*') {
+        if part.is_empty() {
+            continue;
+        }
+        let Some(index) = remaining.find(part) else {
+            return false;
+        };
+        if first && !pattern.starts_with('*') && index != 0 {
+            return false;
+        }
+        remaining = &remaining[index + part.len()..];
+        first = false;
+    }
+    pattern.ends_with('*') || remaining.is_empty()
+}
+
 /// Browser handle.
 ///
 /// Lightweight, cloneable browser operation handle.
@@ -145,6 +353,10 @@ pub struct IframeContext {
     pub frame_id: String,
     /// Frame URL.
     pub url: Option<String>,
+    /// Frame content offset relative to the main viewport.
+    pub offset_x: f64,
+    /// Frame content offset relative to the main viewport.
+    pub offset_y: f64,
 }
 
 /// Browser engine.
@@ -162,14 +374,16 @@ pub struct IframeContext {
 /// ## Example
 ///
 /// ```rust,no_run
-/// use agent_browser_core::{BrowserEngine, BrowserConfig};
+/// use agent_browser_core::{ActionKind, BrowserEngine, BrowserConfig};
 ///
 /// # #[tokio::main]
 /// # async fn main() -> anyhow::Result<()> {
 /// let engine = BrowserEngine::new(BrowserConfig::headed());
 /// engine.navigate("https://example.com").await?;
 /// let snapshot = engine.snapshot().await?;
-/// engine.click("ax1").await?;
+/// engine
+///     .act_with_snapshot(&snapshot.snapshot_id, "ax1", ActionKind::Click)
+///     .await?;
 /// engine.shutdown().await?;
 /// # Ok(())
 /// # }
@@ -177,6 +391,8 @@ pub struct IframeContext {
 pub struct BrowserEngine {
     /// Browser instance.
     browser: Mutex<Option<Arc<Browser>>>,
+    /// Tracks whether the CDP event loop is still alive.
+    browser_alive: Arc<AtomicBool>,
     /// Serializes browser startup so concurrent first requests launch once.
     launch_lock: Mutex<()>,
     /// Combined tab state (single lock to prevent deadlocks).
@@ -191,10 +407,26 @@ pub struct BrowserEngine {
     download_dir: Mutex<Option<PathBuf>>,
     /// Download event broadcaster.
     download_events: broadcast::Sender<DownloadResult>,
+    /// Runtime lifecycle event broadcaster.
+    event_tx: broadcast::Sender<BrowserEvent>,
     /// Network request log (for monitoring).
     network_requests: Arc<Mutex<Vec<crate::types::NetworkRequest>>>,
     /// Console message log (for monitoring).
     console_messages: Arc<Mutex<Vec<crate::types::ConsoleMessage>>>,
+    network_monitoring_enabled: AtomicBool,
+    console_monitoring_enabled: AtomicBool,
+    network_monitor_pages: Mutex<HashSet<String>>,
+    console_monitor_pages: Mutex<HashSet<String>>,
+    /// Pages that already have the network policy interceptor installed.
+    policy_pages: Mutex<HashSet<String>>,
+    /// DNS policy decisions cached by hostname.
+    network_policy_cache: Arc<Mutex<HashMap<String, (bool, Instant)>>>,
+    /// Runtime URL patterns blocked by the agent.
+    blocked_url_patterns: Arc<Mutex<Vec<String>>>,
+    /// Latest page observation used to validate element references.
+    snapshot_state: Mutex<Option<SnapshotState>>,
+    /// Delta produced by the latest observation.
+    last_snapshot_diff: Mutex<Option<SnapshotDiff>>,
 }
 
 /// Combined tab state to prevent deadlocks from acquiring multiple locks.
@@ -218,6 +450,13 @@ struct IframeState {
     active_context_id: Option<i64>,
 }
 
+#[derive(Clone)]
+struct SnapshotState {
+    snapshot: PageSnapshot,
+    page_id: String,
+    frame_id: Option<String>,
+}
+
 struct DownloadListeners {
     begin: chromiumoxide::listeners::EventStream<
         chromiumoxide::cdp::browser_protocol::browser::EventDownloadWillBegin,
@@ -236,8 +475,10 @@ impl BrowserEngine {
     /// Create a new browser engine (not launched).
     pub fn new(config: BrowserConfig) -> Self {
         let (download_events, _) = broadcast::channel(16);
+        let (event_tx, _) = broadcast::channel(256);
         Self {
             browser: Mutex::new(None),
+            browser_alive: Arc::new(AtomicBool::new(false)),
             launch_lock: Mutex::new(()),
             tab_state: Mutex::new(TabState {
                 active_page: None,
@@ -253,16 +494,41 @@ impl BrowserEngine {
             iframe_mapping: Mutex::new(HashMap::new()),
             download_dir: Mutex::new(None),
             download_events,
+            event_tx,
             network_requests: Arc::new(Mutex::new(Vec::new())),
             console_messages: Arc::new(Mutex::new(Vec::new())),
+            network_monitoring_enabled: AtomicBool::new(false),
+            console_monitoring_enabled: AtomicBool::new(false),
+            network_monitor_pages: Mutex::new(HashSet::new()),
+            console_monitor_pages: Mutex::new(HashSet::new()),
+            policy_pages: Mutex::new(HashSet::new()),
+            network_policy_cache: Arc::new(Mutex::new(HashMap::new())),
+            blocked_url_patterns: Arc::new(Mutex::new(Vec::new())),
+            snapshot_state: Mutex::new(None),
+            last_snapshot_diff: Mutex::new(None),
         }
     }
 
     /// Launch the browser.
     pub async fn launch(&self) -> Result<BrowserHandle> {
         let _launch_guard = self.launch_lock.lock().await;
-        if let Some(browser) = self.browser.lock().await.as_ref().cloned() {
+        if self.browser_alive.load(Ordering::SeqCst)
+            && let Some(browser) = self.browser.lock().await.as_ref().cloned()
+        {
             return Ok(BrowserHandle(browser));
+        }
+        if self.browser.lock().await.is_some() {
+            warn!("Discarding stale browser handle after CDP event loop ended");
+            *self.browser.lock().await = None;
+            let mut state = self.tab_state.lock().await;
+            state.active_page = None;
+            state.tabs.clear();
+            state.active_tab_id = None;
+            drop(state);
+            self.reset_frame_state().await;
+            self.policy_pages.lock().await.clear();
+            self.network_monitor_pages.lock().await.clear();
+            self.console_monitor_pages.lock().await.clear();
         }
 
         let headless_str = match self.config.headless {
@@ -301,9 +567,11 @@ impl BrowserEngine {
                 .arg("--disable-blink-features=AutomationControlled")
                 .arg("--disable-infobars")
                 .arg("--disable-dev-shm-usage")
-                .arg("--no-sandbox")
                 .arg("--disable-gpu")
                 .arg("--window-size=1920,1080");
+        }
+        if self.config.no_sandbox {
+            builder = builder.arg("--no-sandbox");
         }
 
         if let Some(ref dir) = self.config.profile_dir {
@@ -330,10 +598,16 @@ impl BrowserEngine {
             .map_err(|e| Error::LaunchFailed(e.to_string()))?;
 
         // 后台驱动 CDP 事件循环
+        let browser_alive = self.browser_alive.clone();
+        let event_tx = self.event_tx.clone();
+        browser_alive.store(true, Ordering::SeqCst);
         tokio::spawn(async move {
             use futures::StreamExt;
             while let Some(ev) = handler.next().await {
                 debug!("Browser event: {:?}", ev);
+            }
+            if browser_alive.swap(false, Ordering::SeqCst) {
+                let _ = event_tx.send(BrowserEvent::BrowserCrashed);
             }
             warn!("Browser handler stream ended");
         });
@@ -343,6 +617,11 @@ impl BrowserEngine {
 
         info!("Browser launched");
         Ok(BrowserHandle(arc))
+    }
+
+    /// Subscribe to browser lifecycle events.
+    pub fn subscribe_events(&self) -> broadcast::Receiver<BrowserEvent> {
+        self.event_tx.subscribe()
     }
 
     /// 确保浏览器已启动
@@ -362,6 +641,7 @@ impl BrowserEngine {
 
                 // 不持有锁的情况下检查页面有效性
                 if page_clone.url().await.is_ok() {
+                    self.ensure_network_policy(&page_clone).await?;
                     return Ok(page_clone);
                 }
                 // 页面无效，继续创建新页面
@@ -380,6 +660,7 @@ impl BrowserEngine {
         if self.config.stealth {
             self.register_stealth_scripts(&page).await?;
         }
+        self.ensure_network_policy(&page).await?;
 
         // 第三步：更新状态（重新获取锁）
         {
@@ -388,6 +669,79 @@ impl BrowserEngine {
         }
 
         Ok(page)
+    }
+
+    async fn ensure_network_policy(&self, page: &Page) -> Result<()> {
+        use chromiumoxide::cdp::browser_protocol::fetch::{
+            ContinueRequestParams, EnableParams, EventRequestPaused, FailRequestParams,
+        };
+        use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
+        use futures::StreamExt;
+
+        let page_id = page.target_id().as_ref().to_string();
+        {
+            let mut installed = self.policy_pages.lock().await;
+            if !installed.insert(page_id) {
+                return Ok(());
+            }
+        }
+
+        let mut events = page
+            .event_listener::<EventRequestPaused>()
+            .await
+            .map_err(|error| Error::Cdp(error.to_string()))?;
+        page.execute(EnableParams {
+            patterns: None,
+            handle_auth_requests: Some(false),
+        })
+        .await
+        .map_err(|error| Error::Cdp(error.to_string()))?;
+
+        let page = page.clone();
+        let config = self.config.clone();
+        let cache = self.network_policy_cache.clone();
+        let blocked_url_patterns = self.blocked_url_patterns.clone();
+        tokio::spawn(async move {
+            while let Some(event) = events.next().await {
+                let request_id = event.request_id.clone();
+                let runtime_blocked = blocked_url_patterns
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|pattern| wildcard_match(pattern, &event.request.url));
+                let decision = if runtime_blocked {
+                    Err(Error::NetworkAccessDenied(format!(
+                        "URL matches a runtime block rule: {}",
+                        event.request.url
+                    )))
+                } else {
+                    validate_url_policy(&config, &cache, &event.request.url).await
+                };
+                match decision {
+                    Ok(_) => {
+                        if let Err(error) =
+                            page.execute(ContinueRequestParams::new(request_id)).await
+                        {
+                            warn!("Failed to continue policy-approved request: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        warn!("Blocked browser request to {}: {error}", event.request.url);
+                        if let Err(fail_error) = page
+                            .execute(FailRequestParams::new(
+                                request_id,
+                                ErrorReason::BlockedByClient,
+                            ))
+                            .await
+                        {
+                            warn!("Failed to block policy-rejected request: {fail_error}");
+                        }
+                    }
+                }
+            }
+        });
+
+        Ok(())
     }
 
     /// 获取当前活动页面
@@ -420,6 +774,24 @@ impl BrowserEngine {
             .map_err(|e| Error::JavaScript(e.to_string()))
     }
 
+    async fn wait_for_actionable_selector(
+        &self,
+        selector: &str,
+        require_editable: bool,
+        timeout_ms: u64,
+    ) -> Result<()> {
+        let page = self.active_page().await?;
+        let context_id = self.iframe_state.lock().await.active_context_id;
+        crate::actions::wait_for_actionable(
+            &page,
+            context_id,
+            selector,
+            require_editable,
+            timeout_ms,
+        )
+        .await
+    }
+
     async fn reset_frame_state(&self) {
         let mut iframe_state = self.iframe_state.lock().await;
         iframe_state.iframe_stack.clear();
@@ -427,6 +799,105 @@ impl BrowserEngine {
         iframe_state.active_context_id = None;
         drop(iframe_state);
         self.iframe_mapping.lock().await.clear();
+        *self.snapshot_state.lock().await = None;
+        *self.last_snapshot_diff.lock().await = None;
+    }
+
+    async fn record_snapshot(&self, snapshot: &PageSnapshot) -> Result<()> {
+        let page = self.active_page().await?;
+        let frame_id = self.iframe_state.lock().await.active_frame_id.clone();
+        let mut state = self.snapshot_state.lock().await;
+        *self.last_snapshot_diff.lock().await = state
+            .as_ref()
+            .map(|previous| snapshot::diff_snapshots(&previous.snapshot, snapshot));
+        *state = Some(SnapshotState {
+            snapshot: snapshot.clone(),
+            page_id: page.target_id().as_ref().to_string(),
+            frame_id,
+        });
+        Ok(())
+    }
+
+    async fn validate_snapshot_ref(
+        &self,
+        snapshot_id: &str,
+        ref_id: Option<&str>,
+    ) -> Result<SnapshotState> {
+        let state =
+            self.snapshot_state
+                .lock()
+                .await
+                .clone()
+                .ok_or_else(|| Error::StaleSnapshot {
+                    expected: snapshot_id.to_string(),
+                    current: "none".to_string(),
+                })?;
+        if state.snapshot.snapshot_id != snapshot_id {
+            return Err(Error::StaleSnapshot {
+                expected: snapshot_id.to_string(),
+                current: state.snapshot.snapshot_id,
+            });
+        }
+
+        let page = self.active_page().await?;
+        let current_page_id = page.target_id().as_ref().to_string();
+        let current_frame_id = self.iframe_state.lock().await.active_frame_id.clone();
+        if state.page_id != current_page_id || state.frame_id != current_frame_id {
+            return Err(Error::StaleSnapshot {
+                expected: snapshot_id.to_string(),
+                current: "page-context-changed".to_string(),
+            });
+        }
+        if let Some(ref_id) = ref_id
+            && snapshot::find_node_by_ref(&state.snapshot.nodes, ref_id).is_none()
+        {
+            return Err(Error::ElementNotFound(ref_id.to_string()));
+        }
+        Ok(state)
+    }
+
+    /// Return the latest snapshot identifier for the active page context.
+    pub async fn current_snapshot_id(&self) -> Option<String> {
+        self.snapshot_state
+            .lock()
+            .await
+            .as_ref()
+            .map(|state| state.snapshot.snapshot_id.clone())
+    }
+
+    /// Capture and compact an accessibility snapshot for an agent context window.
+    pub async fn snapshot_with_options(&self, options: SnapshotOptions) -> Result<PageSnapshot> {
+        let snapshot = self.snapshot().await?;
+        Ok(snapshot::compact_snapshot(&snapshot, &options))
+    }
+
+    /// Search the latest snapshot, capturing one first when needed.
+    pub async fn search_snapshot(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> Result<SnapshotSearchResult> {
+        if query.trim().is_empty() {
+            return Err(Error::InvalidParameter(
+                "Snapshot search query cannot be empty".to_string(),
+            ));
+        }
+        let cached = self
+            .snapshot_state
+            .lock()
+            .await
+            .as_ref()
+            .map(|state| state.snapshot.clone());
+        let snapshot = match cached {
+            Some(snapshot) => snapshot,
+            None => self.snapshot().await?,
+        };
+        Ok(snapshot::search_snapshot(&snapshot, query, max_results))
+    }
+
+    /// Return the delta between the latest two observations.
+    pub async fn latest_snapshot_diff(&self) -> Option<SnapshotDiff> {
+        self.last_snapshot_diff.lock().await.clone()
     }
 
     /// 导航到 URL
@@ -452,13 +923,10 @@ impl BrowserEngine {
         use chromiumoxide::cdp::browser_protocol::page::EventLifecycleEvent;
         use futures::StreamExt;
 
-        // 验证 URL
-        if url.is_empty() {
-            return Err(Error::InvalidParameter("URL cannot be empty".to_string()));
-        }
-        if !url.starts_with("http://") && !url.starts_with("https://") {
+        let parsed_url = validate_url_policy(&self.config, &self.network_policy_cache, url).await?;
+        if !matches!(parsed_url.scheme(), "http" | "https") {
             return Err(Error::InvalidParameter(
-                "URL must start with http:// or https://".to_string(),
+                "Navigation URL must use http:// or https://".to_string(),
             ));
         }
 
@@ -533,10 +1001,15 @@ impl BrowserEngine {
             .ok()
             .flatten()
             .unwrap_or_else(|| url.to_string());
+        validate_url_policy(&self.config, &self.network_policy_cache, &final_url).await?;
 
         let title = page.get_title().await.ok().flatten().unwrap_or_default();
 
         info!("Navigated to: {} (title: {})", final_url, title);
+        let _ = self.event_tx.send(BrowserEvent::Navigated {
+            url: final_url.clone(),
+            title: title.clone(),
+        });
 
         // 注册到 tabs（如果尚未注册）
         {
@@ -662,40 +1135,27 @@ impl BrowserEngine {
 
         // 等待元素出现
         self.wait_for_selector(selector, timeout).await?;
-
-        // 点击元素
-        let click_script = format!(
-            r#"(function() {{
-                const el = document.querySelector({sel:?});
-                if (el) {{
-                    el.click();
-                    return {{ clicked: true, tagName: el.tagName, text: el.textContent.substring(0, 50) }};
-                }}
-                return {{ clicked: false, error: 'Element not found' }};
-            }})()"#,
-            sel = selector
-        );
-
-        let result = self
-            .evaluate_in_active_context(click_script.as_str())
+        self.wait_for_actionable_selector(selector, false, timeout)
             .await?;
 
-        let clicked = result["clicked"].as_bool().unwrap_or(false);
-        if clicked {
-            let tag = result["tagName"].as_str().unwrap_or("");
-            let text = result["text"].as_str().unwrap_or("");
-            info!("Clicked <{}>: {}", tag, text);
-            Ok(ActionResult {
-                success: true,
-                message: format!("Clicked <{}>: {}", tag, text),
-            })
-        } else {
-            let error = result["error"].as_str().unwrap_or("Unknown error");
-            Err(Error::ElementNotFound(format!(
-                "Selector '{}': {}",
-                selector, error
-            )))
-        }
+        let page = self.active_page().await?;
+        let (context_id, offset) = {
+            let state = self.iframe_state.lock().await;
+            let offset = state
+                .iframe_stack
+                .last()
+                .map(|frame| (frame.offset_x, frame.offset_y))
+                .unwrap_or((0.0, 0.0));
+            (state.active_context_id, offset)
+        };
+        crate::actions::dispatch_pointer_action(
+            &page,
+            context_id,
+            selector,
+            &ActionKind::Click,
+            offset,
+        )
+        .await
     }
 
     /// 通过 CSS 选择器输入文本
@@ -721,48 +1181,46 @@ impl BrowserEngine {
 
         // 等待元素出现
         self.wait_for_selector(selector, timeout).await?;
-
-        // 输入文本
-        let type_script = format!(
-            r#"(function() {{
-                const el = document.querySelector({sel:?});
-                if (!el) return {{ success: false, error: 'Element not found' }};
-
-                el.focus();
-                if ({clear}) {{
-                    el.value = '';
-                }}
-                el.value += {text:?};
-
-                // 触发事件
-                el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-
-                return {{ success: true, value: el.value }};
-            }})()"#,
-            sel = selector,
-            clear = clear_first,
-            text = text
-        );
-
-        let result = self
-            .evaluate_in_active_context(type_script.as_str())
+        self.wait_for_actionable_selector(selector, true, timeout)
             .await?;
 
-        let success = result["success"].as_bool().unwrap_or(false);
-        if success {
-            let value = result["value"].as_str().unwrap_or("");
-            Ok(ActionResult {
-                success: true,
-                message: format!("Typed text, current value: {}", value),
-            })
-        } else {
-            let error = result["error"].as_str().unwrap_or("Unknown error");
-            Err(Error::ElementNotFound(format!(
-                "Selector '{}': {}",
-                selector, error
-            )))
+        let focus_script = format!(
+            r#"(() => {{
+                const el = document.querySelector({selector:?});
+                if (!el) return false;
+                el.focus();
+                if ({clear_first}) {{
+                    if (typeof el.select === 'function') el.select();
+                    else {{
+                        const range = document.createRange();
+                        range.selectNodeContents(el);
+                        const selection = getSelection();
+                        selection.removeAllRanges();
+                        selection.addRange(range);
+                    }}
+                }} else if (typeof el.setSelectionRange === 'function') {{
+                    const end = String(el.value || '').length;
+                    el.setSelectionRange(end, end);
+                }}
+                return true;
+            }})()"#
+        );
+        let focused: bool =
+            serde_json::from_value(self.evaluate_in_active_context(&focus_script).await?)?;
+        if !focused {
+            return Err(Error::ElementNotFound(selector.to_string()));
         }
+
+        use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
+        let page = self.active_page().await?;
+        page.execute(InsertTextParams::new(text))
+            .await
+            .map_err(|error| Error::Cdp(error.to_string()))?;
+
+        Ok(ActionResult {
+            success: true,
+            message: format!("Typed {} characters", text.chars().count()),
+        })
     }
 
     /// 获取元素的文本内容
@@ -877,6 +1335,8 @@ impl BrowserEngine {
         let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
 
         self.wait_for_selector(select_selector, timeout).await?;
+        self.wait_for_actionable_selector(select_selector, false, timeout)
+            .await?;
 
         // 尝试标准 select 元素
         let script = if by_text {
@@ -983,49 +1443,26 @@ impl BrowserEngine {
         let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
 
         self.wait_for_selector(selector, timeout).await?;
-
-        let script = format!(
-            r#"(function() {{
-                const el = document.querySelector({sel:?});
-                if (!el) return {{ success: false, error: 'Element not found' }};
-
-                const rect = el.getBoundingClientRect();
-                const x = rect.left + rect.width / 2;
-                const y = rect.top + rect.height / 2;
-
-                el.dispatchEvent(new MouseEvent('mouseover', {{
-                    bubbles: true,
-                    cancelable: true,
-                    clientX: x,
-                    clientY: y
-                }}));
-                el.dispatchEvent(new MouseEvent('mouseenter', {{
-                    bubbles: true,
-                    cancelable: true,
-                    clientX: x,
-                    clientY: y
-                }}));
-
-                return {{ success: true, x: x, y: y }};
-            }})()"#,
-            sel = selector
-        );
-
-        let result = self.evaluate_in_active_context(script.as_str()).await?;
-
-        let success = result["success"].as_bool().unwrap_or(false);
-        if success {
-            Ok(ActionResult {
-                success: true,
-                message: format!(
-                    "Hovered over element at ({}, {})",
-                    result["x"].as_f64().unwrap_or(0.0),
-                    result["y"].as_f64().unwrap_or(0.0)
-                ),
-            })
-        } else {
-            Err(Error::ElementNotFound(format!("Selector '{}'", selector)))
-        }
+        self.wait_for_actionable_selector(selector, false, timeout)
+            .await?;
+        let page = self.active_page().await?;
+        let (context_id, offset) = {
+            let state = self.iframe_state.lock().await;
+            let offset = state
+                .iframe_stack
+                .last()
+                .map(|frame| (frame.offset_x, frame.offset_y))
+                .unwrap_or((0.0, 0.0));
+            (state.active_context_id, offset)
+        };
+        crate::actions::dispatch_pointer_action(
+            &page,
+            context_id,
+            selector,
+            &ActionKind::Hover,
+            offset,
+        )
+        .await
     }
 
     /// 获取页面快照
@@ -1039,7 +1476,9 @@ impl BrowserEngine {
         // 检查是否在 iframe 上下文中
         if let Some(frame_id) = active_frame {
             info!("Taking snapshot in iframe context: {}", frame_id);
-            return self.snapshot_in_frame().await;
+            let snapshot = self.snapshot_in_frame().await?;
+            self.record_snapshot(&snapshot).await?;
+            return Ok(snapshot);
         }
 
         // 主 frame 上下文
@@ -1053,6 +1492,8 @@ impl BrowserEngine {
             mapping.insert(m.ref_id.clone(), m.frame_id.clone());
         }
         info!("Updated {} iframe mappings", mapping.len());
+        drop(mapping);
+        self.record_snapshot(&snapshot).await?;
 
         Ok(snapshot)
     }
@@ -1065,13 +1506,103 @@ impl BrowserEngine {
     /// - `action`: 动作类型
     pub async fn act(&self, ref_id: &str, action: ActionKind) -> Result<ActionResult> {
         let page = self.active_page().await?;
-        let context_id = self.iframe_state.lock().await.active_context_id;
-        if let Some(context_id) = context_id {
-            crate::actions::dispatch_action_in_context(&page, context_id, ref_id, action, None)
-                .await
+        let (context_id, frame_offset) = {
+            let state = self.iframe_state.lock().await;
+            let offset = state
+                .iframe_stack
+                .last()
+                .map(|frame| (frame.offset_x, frame.offset_y))
+                .unwrap_or((0.0, 0.0));
+            (state.active_context_id, offset)
+        };
+        let action_name = format!("{:?}", action);
+        let result = if let Some(context_id) = context_id {
+            crate::actions::dispatch_action_in_context(
+                &page,
+                context_id,
+                ref_id,
+                action,
+                crate::actions::ContextActionOptions {
+                    snapshot_url: None,
+                    snapshot_id: None,
+                    timeout_ms: self.config.action_timeout_ms,
+                    frame_offset,
+                },
+            )
+            .await
         } else {
-            crate::actions::dispatch_action(&page, ref_id, action, None).await
-        }
+            crate::actions::dispatch_action(
+                &page,
+                ref_id,
+                action,
+                None,
+                None,
+                self.config.action_timeout_ms,
+            )
+            .await
+        }?;
+        let _ = self.event_tx.send(BrowserEvent::ActionCompleted {
+            action: action_name,
+            ref_id: ref_id.to_string(),
+        });
+        Ok(result)
+    }
+
+    /// Execute an action only if the element still belongs to the supplied snapshot.
+    pub async fn act_with_snapshot(
+        &self,
+        snapshot_id: &str,
+        ref_id: &str,
+        action: ActionKind,
+    ) -> Result<ActionResult> {
+        let state = self
+            .validate_snapshot_ref(
+                snapshot_id,
+                (!matches!(&action, ActionKind::Scroll { .. } | ActionKind::Wait { .. }))
+                    .then_some(ref_id),
+            )
+            .await?;
+        let page = self.active_page().await?;
+        let (context_id, frame_offset) = {
+            let state = self.iframe_state.lock().await;
+            let offset = state
+                .iframe_stack
+                .last()
+                .map(|frame| (frame.offset_x, frame.offset_y))
+                .unwrap_or((0.0, 0.0));
+            (state.active_context_id, offset)
+        };
+        let action_name = format!("{:?}", action);
+        let result = if let Some(context_id) = context_id {
+            crate::actions::dispatch_action_in_context(
+                &page,
+                context_id,
+                ref_id,
+                action,
+                crate::actions::ContextActionOptions {
+                    snapshot_url: Some(&state.snapshot.url),
+                    snapshot_id: Some(snapshot_id),
+                    timeout_ms: self.config.action_timeout_ms,
+                    frame_offset,
+                },
+            )
+            .await
+        } else {
+            crate::actions::dispatch_action(
+                &page,
+                ref_id,
+                action,
+                Some(&state.snapshot.url),
+                Some(snapshot_id),
+                self.config.action_timeout_ms,
+            )
+            .await
+        }?;
+        let _ = self.event_tx.send(BrowserEvent::ActionCompleted {
+            action: action_name,
+            ref_id: ref_id.to_string(),
+        });
+        Ok(result)
     }
 
     /// 点击元素
@@ -1225,6 +1756,9 @@ impl BrowserEngine {
 
     /// 健康检查
     pub async fn health_check(&self) -> bool {
+        if !self.browser_alive.load(Ordering::SeqCst) {
+            return false;
+        }
         let guard = self.browser.lock().await;
         if let Some(ref browser) = *guard {
             browser.pages().await.is_ok()
@@ -1235,11 +1769,14 @@ impl BrowserEngine {
 
     /// Whether a browser instance has been launched.
     pub async fn is_launched(&self) -> bool {
-        self.browser.lock().await.is_some()
+        self.browser_alive.load(Ordering::SeqCst) && self.browser.lock().await.is_some()
     }
 
     /// 关闭浏览器
     pub async fn shutdown(&self) -> Result<()> {
+        // Mark the shutdown as intentional before closing CDP so the handler task
+        // does not emit a BrowserCrashed event.
+        self.browser_alive.store(false, Ordering::SeqCst);
         let mut browser_guard = self.browser.lock().await;
         let mut state = self.tab_state.lock().await;
 
@@ -1268,6 +1805,23 @@ impl BrowserEngine {
 
             info!("Browser shutdown complete");
         }
+
+        drop(state);
+        drop(browser_guard);
+        self.policy_pages.lock().await.clear();
+        self.network_monitor_pages.lock().await.clear();
+        self.console_monitor_pages.lock().await.clear();
+        self.network_requests.lock().await.clear();
+        self.console_messages.lock().await.clear();
+        self.network_policy_cache.lock().await.clear();
+        self.iframe_mapping.lock().await.clear();
+        *self.snapshot_state.lock().await = None;
+        *self.last_snapshot_diff.lock().await = None;
+        *self.iframe_state.lock().await = IframeState {
+            iframe_stack: Vec::new(),
+            active_frame_id: None,
+            active_context_id: None,
+        };
 
         Ok(())
     }
@@ -1358,6 +1912,34 @@ impl BrowserEngine {
 // ---------------------------------------------------------------------------
 
 impl BrowserEngine {
+    /// Open a new active tab and navigate it to a URL.
+    pub async fn new_tab(&self, url: &str) -> Result<TabInfo> {
+        validate_url_policy(&self.config, &self.network_policy_cache, url).await?;
+        let handle = self.ensure_launched().await?;
+        let page = handle.new_page("about:blank").await?;
+        if self.config.stealth {
+            self.register_stealth_scripts(&page).await?;
+        }
+        self.ensure_network_policy(&page).await?;
+        let tab_id = format!("tab-{}", uuid::Uuid::new_v4());
+        {
+            let mut state = self.tab_state.lock().await;
+            state.tabs.insert(tab_id.clone(), page.clone());
+            state.active_tab_id = Some(tab_id.clone());
+            state.active_page = Some(page);
+        }
+        self.reset_frame_state().await;
+        let navigation = self
+            .navigate_with_options(url, NavigationWaitUntil::Load)
+            .await?;
+        Ok(TabInfo {
+            tab_id,
+            url: navigation.final_url,
+            title: navigation.title,
+            active: true,
+        })
+    }
+
     /// 列出所有标签页
     pub async fn list_tabs(&self) -> Result<Vec<TabInfo>> {
         // 第一步：克隆必要数据（持锁时间尽可能短）
@@ -1403,8 +1985,17 @@ impl BrowserEngine {
             state.active_page = state.tabs.get(tab_id).cloned();
         }
         self.reset_frame_state().await;
+        if self.network_monitoring_enabled.load(Ordering::SeqCst) {
+            self.enable_network_monitoring().await?;
+        }
+        if self.console_monitoring_enabled.load(Ordering::SeqCst) {
+            self.enable_console_monitoring().await?;
+        }
 
         info!("Activated tab: {}", tab_id);
+        let _ = self.event_tx.send(BrowserEvent::TabActivated {
+            tab_id: tab_id.to_string(),
+        });
         Ok(())
     }
 
@@ -1436,6 +2027,9 @@ impl BrowserEngine {
         if was_active {
             self.reset_frame_state().await;
         }
+        let _ = self.event_tx.send(BrowserEvent::TabClosed {
+            tab_id: tab_id.to_string(),
+        });
 
         info!("Closed tab: {}", tab_id);
         Ok(())
@@ -1624,6 +2218,28 @@ impl BrowserEngine {
     ///
     /// 验证文件路径，防止路径遍历攻击。
     pub async fn upload_file(&self, ref_id: &str, file_path: &str) -> Result<()> {
+        self.upload_file_bound(None, ref_id, file_path).await
+    }
+
+    /// Upload a file only when the target belongs to the supplied snapshot.
+    pub async fn upload_file_with_snapshot(
+        &self,
+        snapshot_id: &str,
+        ref_id: &str,
+        file_path: &str,
+    ) -> Result<()> {
+        self.validate_snapshot_ref(snapshot_id, Some(ref_id))
+            .await?;
+        self.upload_file_bound(Some(snapshot_id), ref_id, file_path)
+            .await
+    }
+
+    async fn upload_file_bound(
+        &self,
+        snapshot_id: Option<&str>,
+        ref_id: &str,
+        file_path: &str,
+    ) -> Result<()> {
         use chromiumoxide::cdp::browser_protocol::dom::{
             GetDocumentParams, QuerySelectorParams, SetFileInputFilesParams,
         };
@@ -1632,7 +2248,12 @@ impl BrowserEngine {
         let validated_path = validate_file_path(file_path, &self.config.allowed_file_roots)?;
 
         let page = self.active_page().await?;
-        let selector = format!("[data-agent-ref=\"{}\"]", ref_id);
+        let selector = match snapshot_id {
+            Some(snapshot_id) => {
+                format!("[data-agent-ref={ref_id:?}][data-agent-snapshot={snapshot_id:?}]")
+            }
+            None => format!("[data-agent-ref={ref_id:?}]"),
+        };
 
         // 获取根节点 ID
         let root_node_id = page
@@ -1698,11 +2319,16 @@ impl BrowserEngine {
 
         let page_clone = page.clone();
         let prompt_text = prompt_text.unwrap_or_default();
+        let event_tx = self.event_tx.clone();
 
         tokio::spawn(async move {
             // 循环处理所有对话框，不只是第一个
-            while let Some(_event) = events.next().await {
+            while let Some(event) = events.next().await {
                 debug!("Handling dialog event");
+                let _ = event_tx.send(BrowserEvent::DialogOpened {
+                    message: event.message.clone(),
+                    dialog_type: format!("{:?}", event.r#type),
+                });
                 let _ = page_clone
                     .execute(HandleJavaScriptDialogParams {
                         accept,
@@ -1754,6 +2380,10 @@ impl BrowserEngine {
 
         // 获取该 frame 的执行上下文
         let context_id = self.get_frame_execution_context(&frame_id).await?;
+        let (offset_x, offset_y) = self
+            .get_frame_viewport_offset(&frame_id)
+            .await
+            .unwrap_or((0.0, 0.0));
 
         // 更新 iframe 状态（单一锁，防止竞态条件）
         let mut state = self.iframe_state.lock().await;
@@ -1762,13 +2392,28 @@ impl BrowserEngine {
         state.iframe_stack.push(IframeContext {
             frame_id: frame_id.clone(),
             url: None,
+            offset_x,
+            offset_y,
         });
         let depth = state.iframe_stack.len();
         info!(
             "Entered iframe: ref_id={}, frame_id={}, context_id={}, depth={}",
             ref_id, frame_id, context_id, depth
         );
+        drop(state);
+        *self.snapshot_state.lock().await = None;
         Ok(depth)
+    }
+
+    /// Enter an iframe only when its reference belongs to the supplied snapshot.
+    pub async fn enter_iframe_with_snapshot(
+        &self,
+        snapshot_id: &str,
+        ref_id: &str,
+    ) -> Result<usize> {
+        self.validate_snapshot_ref(snapshot_id, Some(ref_id))
+            .await?;
+        self.enter_iframe(ref_id).await
     }
 
     /// 通过搜索 frame tree 进入 iframe（备用方案）
@@ -1791,6 +2436,10 @@ impl BrowserEngine {
         if let Some(fid) = frame_id {
             // 获取执行上下文
             let context_id = self.get_frame_execution_context(&fid).await?;
+            let (offset_x, offset_y) = self
+                .get_frame_viewport_offset(&fid)
+                .await
+                .unwrap_or((0.0, 0.0));
 
             // 更新 iframe 状态（单一锁）
             let mut state = self.iframe_state.lock().await;
@@ -1799,6 +2448,8 @@ impl BrowserEngine {
             state.iframe_stack.push(IframeContext {
                 frame_id: fid.clone(),
                 url: None,
+                offset_x,
+                offset_y,
             });
             let depth = state.iframe_stack.len();
 
@@ -1806,7 +2457,8 @@ impl BrowserEngine {
                 "Entered iframe (search): ref_id={}, frame_id={}, depth={}",
                 ref_id, fid, depth
             );
-
+            drop(state);
+            *self.snapshot_state.lock().await = None;
             Ok(depth)
         } else {
             Err(Error::ElementNotFound(format!(
@@ -1837,6 +2489,31 @@ impl BrowserEngine {
             .execution_context_id;
         let context_id = *context.inner();
         Ok(context_id)
+    }
+
+    async fn get_frame_viewport_offset(&self, frame_id: &str) -> Result<(f64, f64)> {
+        use chromiumoxide::cdp::browser_protocol::dom::{GetBoxModelParams, GetFrameOwnerParams};
+
+        let page = self.active_page().await?;
+        let owner = page
+            .execute(GetFrameOwnerParams::new(frame_id.to_string()))
+            .await
+            .map_err(|error| Error::Cdp(error.to_string()))?;
+        let model = page
+            .execute(GetBoxModelParams {
+                node_id: owner.node_id,
+                backend_node_id: Some(owner.backend_node_id),
+                object_id: None,
+            })
+            .await
+            .map_err(|error| Error::Cdp(error.to_string()))?
+            .model
+            .clone();
+        let quad = model.content.inner();
+        Ok((
+            quad.first().copied().unwrap_or_default(),
+            quad.get(1).copied().unwrap_or_default(),
+        ))
     }
 
     /// 退出 iframe
@@ -1878,7 +2555,7 @@ impl BrowserEngine {
             state.active_frame_id = parent_frame_id;
             state.active_context_id = parent_context_id;
         }
-
+        *self.snapshot_state.lock().await = None;
         Ok(depth)
     }
 
@@ -1892,7 +2569,8 @@ impl BrowserEngine {
         state.active_frame_id = None;
         state.active_context_id = None;
         info!("Exited all iframes");
-
+        drop(state);
+        *self.snapshot_state.lock().await = None;
         Ok(())
     }
 
@@ -1918,6 +2596,7 @@ impl BrowserEngine {
 
         let page = self.active_page().await?;
         let active_frame = self.iframe_state.lock().await.active_frame_id.clone();
+        let snapshot_id = uuid::Uuid::new_v4().to_string();
 
         // 启用 Accessibility 域
         let _ = page.execute(EnableParams {}).await;
@@ -1937,7 +2616,7 @@ impl BrowserEngine {
 
         if ax_nodes.is_empty() {
             return Ok(PageSnapshot {
-                snapshot_id: uuid::Uuid::new_v4().to_string(),
+                snapshot_id,
                 url: String::new(),
                 title: String::new(),
                 nodes: Vec::new(),
@@ -1951,13 +2630,14 @@ impl BrowserEngine {
         }
 
         // 处理节点
-        let (nodes, _) = crate::snapshot::process_ax_nodes_in_frame(&page, &ax_nodes, 0).await?;
+        let (nodes, _) =
+            crate::snapshot::process_ax_nodes_in_frame(&page, &ax_nodes, 0, &snapshot_id).await?;
 
         let url = page.url().await.ok().flatten().unwrap_or_default();
         let title = page.get_title().await.ok().flatten().unwrap_or_default();
 
         Ok(PageSnapshot {
-            snapshot_id: uuid::Uuid::new_v4().to_string(),
+            snapshot_id,
             url,
             title,
             nodes,
@@ -2184,6 +2864,9 @@ impl BrowserEngine {
                                 status: DownloadStatus::Completed,
                             };
                             let _ = self.download_events.send(result.clone());
+                            let _ = self
+                                .event_tx
+                                .send(BrowserEvent::DownloadCompleted(result.clone()));
                             info!("Download completed: {} -> {:?}", event.guid, file_path);
                             return Ok(result);
                         }
@@ -2247,6 +2930,26 @@ impl BrowserEngine {
         ref_id: &str,
         options: Option<DownloadOptions>,
     ) -> Result<DownloadResult> {
+        self.click_and_download_bound(None, ref_id, options).await
+    }
+
+    /// Click a snapshot-bound element and wait for its download.
+    pub async fn click_and_download_with_snapshot(
+        &self,
+        snapshot_id: &str,
+        ref_id: &str,
+        options: Option<DownloadOptions>,
+    ) -> Result<DownloadResult> {
+        self.click_and_download_bound(Some(snapshot_id), ref_id, options)
+            .await
+    }
+
+    async fn click_and_download_bound(
+        &self,
+        snapshot_id: Option<&str>,
+        ref_id: &str,
+        options: Option<DownloadOptions>,
+    ) -> Result<DownloadResult> {
         let opts = options.unwrap_or_default();
         let timeout = opts.timeout_ms.unwrap_or(60000);
 
@@ -2255,7 +2958,12 @@ impl BrowserEngine {
         let listeners = self.create_download_listeners().await?;
 
         // 点击元素
-        self.click(ref_id).await?;
+        if let Some(snapshot_id) = snapshot_id {
+            self.act_with_snapshot(snapshot_id, ref_id, ActionKind::Click)
+                .await?;
+        } else {
+            self.click(ref_id).await?;
+        }
 
         info!("Clicked element {} for download", ref_id);
 
@@ -2578,12 +3286,23 @@ impl BrowserEngine {
                         url: event.request.url.clone(),
                         method: event.request.method.clone(),
                         resource_type,
-                        headers: event.request.headers.inner().clone(),
-                        post_data: event
-                            .request
-                            .has_post_data
-                            .unwrap_or(false)
-                            .then_some(String::new()),
+                        headers: sanitize_headers(
+                            event.request.headers.inner().clone(),
+                            self.config.capture_sensitive_data,
+                        ),
+                        post_data: self
+                            .config
+                            .capture_sensitive_data
+                            .then(|| {
+                                event
+                                    .request
+                                    .post_data_entries
+                                    .as_ref()
+                                    .and_then(|entries| entries.first())
+                                    .and_then(|entry| entry.bytes.clone())
+                                    .map(String::from)
+                            })
+                            .flatten(),
                     });
                 }
                 Ok(None) => break,
@@ -2630,7 +3349,10 @@ impl BrowserEngine {
                         url: event.response.url.clone(),
                         status: event.response.status as i32,
                         status_text: event.response.status_text.clone(),
-                        headers: event.response.headers.inner().clone(),
+                        headers: sanitize_headers(
+                            event.response.headers.inner().clone(),
+                            self.config.capture_sensitive_data,
+                        ),
                         mime_type: Some(event.response.mime_type.clone()),
                         blocked: false,
                     });
@@ -2672,49 +3394,24 @@ impl BrowserEngine {
     /// - `url_pattern`: URL 匹配模式（如 "*" 匹配所有请求）
     /// - `block`: 是否阻止匹配的请求
     pub async fn intercept_requests(&self, url_pattern: &str, block: bool) -> Result<()> {
-        use chromiumoxide::cdp::browser_protocol::fetch::{
-            EnableParams, RequestPattern, RequestStage,
-        };
-
+        if url_pattern.trim().is_empty() {
+            return Err(Error::InvalidParameter(
+                "URL interception pattern cannot be empty".to_string(),
+            ));
+        }
         let page = self.active_page().await?;
-        let pattern = RequestPattern {
-            url_pattern: Some(url_pattern.to_string()),
-            resource_type: None,
-            request_stage: Some(RequestStage::Request),
-        };
-
-        page.execute(EnableParams {
-            patterns: Some(vec![pattern]),
-            handle_auth_requests: Some(false),
-        })
-        .await
-        .map_err(|e| Error::Cdp(e.to_string()))?;
-
+        self.ensure_network_policy(&page).await?;
+        let mut patterns = self.blocked_url_patterns.lock().await;
         if block {
-            // 监听暂停的请求并阻止它们
-            use chromiumoxide::cdp::browser_protocol::fetch::{
-                EventRequestPaused, FailRequestParams,
-            };
-            use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
-            use futures::StreamExt;
-
-            let mut stream = page
-                .event_listener::<EventRequestPaused>()
-                .await
-                .map_err(|e| Error::Cdp(e.to_string()))?;
-
-            tokio::spawn(async move {
-                while let Some(event) = stream.next().await {
-                    let request_id = event.request_id.clone();
-                    // 使用 page 的引用来执行 fail 请求 - 简单阻止
-                    let params = FailRequestParams::new(request_id, ErrorReason::Aborted);
-                    let _ = page.execute(params).await;
-                }
-            });
+            if !patterns.iter().any(|pattern| pattern == url_pattern) {
+                patterns.push(url_pattern.to_string());
+            }
+        } else {
+            patterns.retain(|pattern| pattern != url_pattern);
         }
 
         info!(
-            "Request interception enabled for pattern: {} (block: {})",
+            "Request block rule updated for pattern: {} (block: {})",
             url_pattern, block
         );
         Ok(())
@@ -2722,15 +3419,14 @@ impl BrowserEngine {
 
     /// 禁用请求拦截
     pub async fn disable_interception(&self) -> Result<()> {
-        use chromiumoxide::cdp::browser_protocol::fetch::DisableParams;
-
-        let page = self.active_page().await?;
-        page.execute(DisableParams::default())
-            .await
-            .map_err(|e| Error::Cdp(e.to_string()))?;
-
-        info!("Request interception disabled");
+        self.blocked_url_patterns.lock().await.clear();
+        info!("Runtime request block rules cleared");
         Ok(())
+    }
+
+    /// List active runtime request block rules.
+    pub async fn blocked_request_patterns(&self) -> Vec<String> {
+        self.blocked_url_patterns.lock().await.clone()
     }
 }
 
@@ -2990,14 +3686,14 @@ impl BrowserEngine {
                 if form_roles.contains(&node.role.as_str()) && node.name.contains(label) {
                     return Ok(node.ref_id.clone());
                 }
-                if node.role == "label" && node.name.contains(label) {
-                    if let Some(child) = node
+                if node.role == "label"
+                    && node.name.contains(label)
+                    && let Some(child) = node
                         .children
                         .iter()
                         .find(|child| form_roles.contains(&child.role.as_str()))
-                    {
-                        return Ok(child.ref_id.clone());
-                    }
+                {
+                    return Ok(child.ref_id.clone());
                 }
                 if node
                     .attributes
@@ -3221,6 +3917,12 @@ impl BrowserEngine {
         use futures::StreamExt;
 
         let page = self.active_page().await?;
+        self.network_monitoring_enabled
+            .store(true, Ordering::SeqCst);
+        let page_id = page.target_id().as_ref().to_string();
+        if !self.network_monitor_pages.lock().await.insert(page_id) {
+            return Ok(());
+        }
 
         // 启用 Network 域
         page.execute(EnableParams::default())
@@ -3234,6 +3936,7 @@ impl BrowserEngine {
             .map_err(|e| Error::Cdp(e.to_string()))?;
 
         let network_requests = self.network_requests.clone();
+        let capture_sensitive_data = self.config.capture_sensitive_data;
 
         tokio::spawn(async move {
             while let Some(event) = events.next().await {
@@ -3257,9 +3960,12 @@ impl BrowserEngine {
                         .as_ref()
                         .map(|t| format!("{:?}", t))
                         .unwrap_or_default(),
-                    headers: serde_json::to_value(&event.request.headers)
-                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
-                    post_data,
+                    headers: sanitize_headers(
+                        serde_json::to_value(&event.request.headers)
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                        capture_sensitive_data,
+                    ),
+                    post_data: capture_sensitive_data.then_some(post_data).flatten(),
                 };
 
                 let mut reqs = network_requests.lock().await;
@@ -3303,6 +4009,12 @@ impl BrowserEngine {
         use futures::StreamExt;
 
         let page = self.active_page().await?;
+        self.console_monitoring_enabled
+            .store(true, Ordering::SeqCst);
+        let page_id = page.target_id().as_ref().to_string();
+        if !self.console_monitor_pages.lock().await.insert(page_id) {
+            return Ok(());
+        }
 
         // 启用 Runtime 域
         page.execute(EnableParams::default())
@@ -3443,6 +4155,18 @@ mod tests {
 
         std::fs::remove_dir_all(root).expect("remove allowed root");
         std::fs::remove_dir_all(outside).expect("remove outside root");
+    }
+
+    #[test]
+    fn wildcard_origin_matches_scheme_and_port() {
+        let https = Url::parse("https://app.example.com/path").unwrap();
+        let http = Url::parse("http://app.example.com/path").unwrap();
+        let custom_port = Url::parse("https://app.example.com:8443/path").unwrap();
+
+        assert!(origin_matches("https://*.example.com", &https));
+        assert!(!origin_matches("https://*.example.com", &http));
+        assert!(!origin_matches("https://*.example.com", &custom_port));
+        assert!(origin_matches("https://*.example.com:8443", &custom_port));
     }
 }
 

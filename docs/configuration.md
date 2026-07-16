@@ -16,7 +16,13 @@ The main configuration struct for browser settings.
 | `navigation_timeout_ms` | `u64` | `30000` | Navigation timeout in milliseconds |
 | `action_timeout_ms` | `u64` | `10000` | Action timeout in milliseconds |
 | `stealth` | `bool` | `true` | Enable anti-detection scripts |
+| `no_sandbox` | `bool` | `false` | Explicitly add Chrome's `--no-sandbox` flag |
 | `extra_args` | `Vec<String>` | `[]` | Additional Chrome arguments |
+| `allowed_file_roots` | `Vec<PathBuf>` | current directory and temp | Upload/download filesystem boundary |
+| `allowed_origins` | `Vec<String>` | `[]` | Optional exact/wildcard origin allowlist |
+| `blocked_origins` | `Vec<String>` | `[]` | Origin denylist, evaluated first |
+| `allow_private_networks` | `bool` | `false` | Allow loopback/private/link-local destinations |
+| `capture_sensitive_data` | `bool` | `false` | Preserve auth headers and request bodies in monitoring |
 
 ### HeadlessMode
 
@@ -48,6 +54,15 @@ let config = BrowserConfig::default()
 
     // Enable/disable stealth
     .with_stealth(true)
+
+    // Keep Chrome sandboxing enabled unless the runtime cannot support it
+    .with_no_sandbox(false)
+
+    // Restrict browser network and filesystem access
+    .with_allowed_origins(["https://example.com", "https://*.example.org"])
+    .with_blocked_origins(["https://admin.example.com"])
+    .with_private_networks(false)
+    .with_allowed_file_roots(["/tmp/agent-browser"])
 
     // Add Chrome arguments
     .with_arg("--disable-web-security")
@@ -83,9 +98,18 @@ let config = BrowserConfig::headless_old();
 | `BROWSER_HTTP_HOST` | Bind address; non-loopback requires an API key | `127.0.0.1` |
 | `BROWSER_HTTP_PORT` | Server port | `3000` |
 | `BROWSER_HEADLESS` | `false` for headed, `old` for legacy headless, otherwise new headless | new headless |
+| `BROWSER_STEALTH` | Enable stealth scripts | `true` |
+| `BROWSER_NO_SANDBOX` | Explicitly disable Chrome sandboxing | `false` |
 | `BROWSER_API_KEY` | API key for authentication | - |
 | `BROWSER_DEFAULT_TIMEOUT_MS` | Default timeout in milliseconds | `30000` |
 | `BROWSER_ALLOWED_FILE_ROOTS` | Platform-separated upload/download roots | current directory and temp directory |
+| `BROWSER_ALLOWED_ORIGINS` | Comma-separated exact/wildcard origin allowlist | unrestricted public origins |
+| `BROWSER_BLOCKED_ORIGINS` | Comma-separated origin denylist | - |
+| `BROWSER_ALLOW_PRIVATE_NETWORKS` | Allow loopback/private/link-local targets | `false` |
+| `BROWSER_CAPTURE_SENSITIVE_DATA` | Preserve credentials/request bodies in network logs | `false` |
+| `BROWSER_NAVIGATION_TIMEOUT_MS` | Navigation timeout | `30000` |
+| `BROWSER_ACTION_TIMEOUT_MS` | Actionability timeout | `10000` |
+| `BROWSER_MCP_CAPS` | Optional MCP capability allowlist (`network,storage,files,devtools`) | all |
 
 ### Example
 
@@ -93,8 +117,10 @@ let config = BrowserConfig::headless_old();
 # Start HTTP server with custom settings
 BROWSER_HTTP_PORT=8080 \
 BROWSER_HEADLESS=1 \
+BROWSER_NO_SANDBOX=false \
 BROWSER_API_KEY=secret123 \
 BROWSER_ALLOWED_FILE_ROOTS=/tmp:/path/to/workspace \
+BROWSER_ALLOWED_ORIGINS=https://example.com,https://*.example.org \
 BROWSER_DEFAULT_TIMEOUT_MS=60000 \
 ./target/release/agent-browser-http
 ```
@@ -109,7 +135,7 @@ BROWSER_DEFAULT_TIMEOUT_MS=60000 \
 | `--disable-features=IsolateOrigins,site-per-process` | Disable site isolation |
 | `--window-size=WIDTH,HEIGHT` | Set window size |
 | `--disable-gpu` | Disable GPU hardware acceleration |
-| `--no-sandbox` | Disable sandbox (required for some environments) |
+| `--no-sandbox` | Disable sandbox; use only when the runtime cannot support Chrome sandboxing |
 | `--disable-setuid-sandbox` | Disable setuid sandbox |
 | `--disable-dev-shm-usage` | Use /tmp instead of /dev/shm |
 | `--disable-blink-features=AutomationControlled` | Hide automation indicators |
@@ -254,7 +280,9 @@ let config = BrowserConfig::headed()
 ```rust
 let config = BrowserConfig::headless()
     .with_stealth(true)
-    .with_arg("--no-sandbox")
+    .with_no_sandbox(true)
     .with_arg("--disable-setuid-sandbox")
     .with_arg("--disable-dev-shm-usage");
 ```
+
+`with_no_sandbox(true)` weakens process isolation. Prefer a container/runtime that supports Chrome sandboxing.

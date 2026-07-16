@@ -60,6 +60,18 @@ pub enum Error {
     /// Path security error.
     #[error("Invalid path: {0}")]
     InvalidPath(String),
+
+    /// Network access policy rejected a URL.
+    #[error("Network access denied: {0}")]
+    NetworkAccessDenied(String),
+
+    /// An element reference belongs to an older page snapshot.
+    #[error("Stale snapshot: expected {expected}, current {current}")]
+    StaleSnapshot { expected: String, current: String },
+
+    /// The target exists but is not currently safe to interact with.
+    #[error("Element is not actionable: {0}")]
+    ElementNotActionable(String),
 }
 
 /// Result type alias.

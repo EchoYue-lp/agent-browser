@@ -3,22 +3,79 @@
 //! 包含工具注解（annotations）以描述工具行为
 
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
-use crate::protocol::{Tool, ToolAnnotations};
+use crate::protocol::{Tool, ToolAnnotations, ToolExecution};
 
 /// 获取所有工具定义
 pub fn get_tool_definitions() -> Vec<Tool> {
+    let enabled_caps = std::env::var("BROWSER_MCP_CAPS").ok().map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect::<HashSet<_>>()
+    });
     TOOLS
         .iter()
+        .filter(|definition| {
+            enabled_caps.as_ref().is_none_or(|caps| {
+                caps.contains("all")
+                    || tool_capability(definition.name)
+                        .is_none_or(|capability| caps.contains(capability))
+            })
+        })
         .map(|def| Tool {
             name: def.name.to_string(),
             title: def.title.map(|s| s.to_string()),
             description: Some(def.description.to_string()),
             input_schema: (def.input_schema)(),
-            output_schema: None,
+            output_schema: Some(json!({"type": "object"})),
             annotations: Some(def.annotations.clone()),
+            execution: is_task_supported(def.name).then(|| ToolExecution {
+                task_support: "optional".to_string(),
+            }),
         })
         .collect()
+}
+
+/// Return whether a tool is exposed under the configured capability policy.
+pub fn is_tool_enabled(name: &str) -> bool {
+    get_tool_definitions().iter().any(|tool| tool.name == name)
+}
+
+/// Long-running tools that can be detached and polled through the MCP task API.
+pub fn is_task_supported(name: &str) -> bool {
+    matches!(
+        name,
+        "browser_navigate"
+            | "browser_wait"
+            | "browser_wait_for_network_idle"
+            | "browser_download_file"
+            | "browser_click_and_download"
+            | "browser_navigate_with_options"
+    )
+}
+
+fn tool_capability(name: &str) -> Option<&'static str> {
+    match name {
+        "browser_enable_network_monitoring"
+        | "browser_get_network_requests"
+        | "browser_clear_network_requests"
+        | "browser_network" => Some("network"),
+        "browser_get_cookies" | "browser_set_cookies" => Some("storage"),
+        "browser_evaluate"
+        | "browser_enable_console_monitoring"
+        | "browser_get_console_messages"
+        | "browser_clear_console_messages"
+        | "browser_set_viewport"
+        | "browser_get_viewport"
+        | "browser_emulate_device"
+        | "browser_dialog" => Some("devtools"),
+        "browser_upload" | "browser_download_file" | "browser_click_and_download" => Some("files"),
+        _ => None,
+    }
 }
 
 /// 工具定义
@@ -61,7 +118,38 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_snapshot",
         title: Some("Get Page Snapshot"),
         description: "Get Accessibility Tree snapshot of the page. Returns ref_id, role, name for all interactive elements. Call this first to understand page structure.",
-        input_schema: || json!({ "type": "object", "properties": {} }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "interactive_only": {"type": "boolean", "default": true},
+                    "root_ref": {"type": "string"},
+                    "max_depth": {"type": "integer", "minimum": 0, "maximum": 50},
+                    "max_nodes": {"type": "integer", "minimum": 1, "maximum": 5000}
+                }
+            })
+        },
+        annotations: ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    },
+    ToolDefinition {
+        name: "browser_snapshot_search",
+        title: Some("Search Page Snapshot"),
+        description: "Search the latest accessibility snapshot without returning the full tree.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "minimum": 1, "maximum": 200, "default": 20}
+                },
+                "required": ["query"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(true),
             destructive_hint: Some(false),
@@ -78,12 +166,13 @@ static TOOLS: &[ToolDefinition] = &[
             json!({
                 "type": "object",
                 "properties": {
+                    "snapshot_id": { "type": "string", "description": "Snapshot ID that produced the element reference" },
                     "ref_id": {
                         "type": "string",
                         "description": "Element reference ID (e.g., 'ax1', 'e5')"
                     }
                 },
-                "required": ["ref_id"]
+                "required": ["snapshot_id", "ref_id"]
             })
         },
         annotations: ToolAnnotations {
@@ -102,11 +191,12 @@ static TOOLS: &[ToolDefinition] = &[
             json!({
                 "type": "object",
                 "properties": {
+                    "snapshot_id": { "type": "string", "description": "Snapshot ID that produced the element reference" },
                     "ref_id": { "type": "string", "description": "Element reference ID" },
                     "text": { "type": "string", "description": "Text to type" },
                     "clear_first": { "type": "boolean", "description": "Clear field first (default: false)" }
                 },
-                "required": ["ref_id", "text"]
+                "required": ["snapshot_id", "ref_id", "text"]
             })
         },
         annotations: ToolAnnotations {
@@ -125,10 +215,11 @@ static TOOLS: &[ToolDefinition] = &[
             json!({
                 "type": "object",
                 "properties": {
+                    "snapshot_id": { "type": "string", "description": "Snapshot ID that produced the element reference" },
                     "ref_id": { "type": "string", "description": "Element reference ID" },
                     "key": { "type": "string", "description": "Key name (e.g., 'Enter', 'Tab', 'Escape', 'ArrowDown')" }
                 },
-                "required": ["ref_id", "key"]
+                "required": ["snapshot_id", "ref_id", "key"]
             })
         },
         annotations: ToolAnnotations {
@@ -147,9 +238,11 @@ static TOOLS: &[ToolDefinition] = &[
             json!({
                 "type": "object",
                 "properties": {
+                    "snapshot_id": { "type": "string", "description": "Current snapshot ID" },
                     "direction": { "type": "string", "enum": ["up", "down", "left", "right"], "description": "Direction (default: down)" },
                     "amount": { "type": "integer", "description": "Pixels to scroll (default: 300)" }
-                }
+                },
+                "required": ["snapshot_id"]
             })
         },
         annotations: ToolAnnotations {
@@ -329,10 +422,11 @@ static TOOLS: &[ToolDefinition] = &[
             json!({
                 "type": "object",
                 "properties": {
+                    "snapshot_id": { "type": "string", "description": "Snapshot ID that produced the element reference" },
                     "ref_id": { "type": "string", "description": "File input element reference ID" },
                     "file_path": { "type": "string", "description": "Absolute path to local file" }
                 },
-                "required": ["ref_id", "file_path"]
+                "required": ["snapshot_id", "ref_id", "file_path"]
             })
         },
         annotations: ToolAnnotations {
@@ -385,9 +479,10 @@ static TOOLS: &[ToolDefinition] = &[
             json!({
                 "type": "object",
                 "properties": {
+                    "snapshot_id": { "type": "string", "description": "Snapshot ID that produced the iframe reference" },
                     "ref_id": { "type": "string", "description": "Iframe element reference ID" }
                 },
-                "required": ["ref_id"]
+                "required": ["snapshot_id", "ref_id"]
             })
         },
         annotations: ToolAnnotations {
@@ -452,11 +547,12 @@ static TOOLS: &[ToolDefinition] = &[
             json!({
                 "type": "object",
                 "properties": {
+                    "snapshot_id": { "type": "string", "description": "Snapshot ID that produced the element reference" },
                     "ref_id": { "type": "string", "description": "Element to click" },
                     "save_path": { "type": "string", "description": "Save directory (optional)" },
                     "timeout_ms": { "type": "integer", "description": "Download timeout (default: 60000)" }
                 },
-                "required": ["ref_id"]
+                "required": ["snapshot_id", "ref_id"]
             })
         },
         annotations: ToolAnnotations {
@@ -638,6 +734,107 @@ static TOOLS: &[ToolDefinition] = &[
         input_schema: || json!({ "type": "object", "properties": {} }),
         annotations: ToolAnnotations {
             read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    },
+    ToolDefinition {
+        name: "browser_new_tab",
+        title: Some("Open New Tab"),
+        description: "Open a new isolated tab and make it active.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"]
+            })
+        },
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(false),
+            open_world_hint: Some(true),
+        },
+    },
+    ToolDefinition {
+        name: "browser_find",
+        title: Some("Find Semantic Element"),
+        description: "Find an element by role, text, or label and return a snapshot-bound reference.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "strategy": {"type": "string", "enum": ["role", "text", "label"]},
+                    "query": {"type": "string"},
+                    "name": {"type": "string", "description": "Accessible name filter for role strategy"},
+                    "timeout_ms": {"type": "integer", "minimum": 1, "maximum": 120000}
+                },
+                "required": ["strategy", "query"]
+            })
+        },
+        annotations: ToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    },
+    ToolDefinition {
+        name: "browser_dialog",
+        title: Some("Configure Dialog Handling"),
+        description: "Configure how JavaScript dialogs are handled before triggering an action.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "accept": {"type": "boolean", "default": true},
+                    "prompt_text": {"type": "string"}
+                }
+            })
+        },
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    },
+    ToolDefinition {
+        name: "browser_network",
+        title: Some("Manage Network Rules"),
+        description: "Block/unblock URL patterns, list rules, or read a captured response body.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "operation": {"type": "string", "enum": ["block", "unblock", "clear", "list", "response_body"]},
+                    "pattern": {"type": "string"},
+                    "request_id": {"type": "string"}
+                },
+                "required": ["operation"]
+            })
+        },
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        },
+    },
+    ToolDefinition {
+        name: "browser_emulate_device",
+        title: Some("Emulate Device"),
+        description: "Apply a built-in mobile device viewport profile.",
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {"device": {"type": "string"}},
+                "required": ["device"]
+            })
+        },
+        annotations: ToolAnnotations {
+            read_only_hint: Some(false),
             destructive_hint: Some(false),
             idempotent_hint: Some(true),
             open_world_hint: Some(false),

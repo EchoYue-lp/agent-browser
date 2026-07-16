@@ -4,7 +4,7 @@ This guide will help you get Agent Browser up and running quickly.
 
 ## Prerequisites
 
-- **Rust** 1.85 or later
+- **Rust** 1.88 or later
 - **Chrome** or **Chromium** browser (automatically detected)
 
 ## Installation
@@ -125,7 +125,7 @@ anyhow = "1.0"
 #### Basic Usage
 
 ```rust
-use agent_browser_core::{BrowserEngine, BrowserConfig};
+use agent_browser_core::{ActionKind, BrowserEngine, BrowserConfig};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -140,8 +140,10 @@ async fn main() -> anyhow::Result<()> {
     println!("Title: {}", snapshot.title);
     println!("Nodes: {}", snapshot.nodes.len());
 
-    // Click element using ref_id
-    engine.click("ax1").await?;
+    // Bind the action to the snapshot that produced the ref_id
+    engine
+        .act_with_snapshot(&snapshot.snapshot_id, "ax1", ActionKind::Click)
+        .await?;
 
     // Or use CSS selector directly (recommended)
     engine.click_selector("button.submit", None).await?;
@@ -196,9 +198,13 @@ let engine = BrowserEngine::new(config);
 | `BROWSER_HTTP_HOST` | Bind address | `127.0.0.1` |
 | `BROWSER_HTTP_PORT` | Server port | `3000` |
 | `BROWSER_HEADLESS` | Browser display mode | new headless |
+| `BROWSER_NO_SANDBOX` | Explicitly disable Chrome sandboxing | `false` |
 | `BROWSER_API_KEY` | API key for authentication | - |
 | `BROWSER_DEFAULT_TIMEOUT_MS` | Default timeout in milliseconds | `30000` |
 | `BROWSER_ALLOWED_FILE_ROOTS` | Upload/download roots | current directory and temp directory |
+| `BROWSER_ALLOWED_ORIGINS` | Comma-separated origin allowlist | unrestricted public origins |
+| `BROWSER_BLOCKED_ORIGINS` | Comma-separated origin denylist | - |
+| `BROWSER_ALLOW_PRIVATE_NETWORKS` | Allow private/loopback targets | `false` |
 
 ## Next Steps
 

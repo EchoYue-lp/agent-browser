@@ -7,9 +7,9 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 authors = ["EchoYue"]
 license = "MIT"
 repository = "https://github.com/EchoYue/agent-browser"
@@ -54,6 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 工具
 uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
+url = "2.5"
 
 # HTTP 相关
 axum = { version = "0.7", features = ["ws", "macros"] }

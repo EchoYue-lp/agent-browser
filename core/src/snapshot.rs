@@ -95,6 +95,68 @@ pub struct PageSnapshot {
     pub iframe_mappings: Vec<IframeMapping>,
 }
 
+/// Controls how much of a page snapshot is returned to an agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotOptions {
+    /// Keep only actionable nodes and the ancestors needed to reach them.
+    #[serde(default = "default_true")]
+    pub interactive_only: bool,
+    /// Optional subtree root reference.
+    #[serde(default)]
+    pub root_ref: Option<String>,
+    /// Maximum tree depth to return.
+    #[serde(default)]
+    pub max_depth: Option<usize>,
+    /// Maximum number of nodes to return.
+    #[serde(default = "default_max_nodes")]
+    pub max_nodes: usize,
+}
+
+impl Default for SnapshotOptions {
+    fn default() -> Self {
+        Self {
+            interactive_only: true,
+            root_ref: None,
+            max_depth: Some(8),
+            max_nodes: default_max_nodes(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_nodes() -> usize {
+    250
+}
+
+/// Compact identity of a node used by search and snapshot diffs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SnapshotNodeSummary {
+    pub ref_id: String,
+    pub role: String,
+    pub name: String,
+    pub path: String,
+}
+
+/// Search result in the latest page snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotSearchResult {
+    pub snapshot_id: String,
+    pub matches: Vec<SnapshotNodeSummary>,
+}
+
+/// Changes between two consecutive observations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotDiff {
+    pub from_snapshot_id: String,
+    pub to_snapshot_id: String,
+    pub added: Vec<SnapshotNodeSummary>,
+    pub removed: Vec<SnapshotNodeSummary>,
+    pub changed: Vec<SnapshotNodeSummary>,
+}
+
 /// Generate page snapshot using CDP (supports iframes).
 ///
 /// Falls back to JS implementation if CDP fails.
@@ -130,6 +192,7 @@ async fn generate_snapshot_cdp_with_frames(page: &Page) -> Result<PageSnapshot> 
     use chromiumoxide::cdp::browser_protocol::accessibility::{EnableParams, GetFullAxTreeParams};
     use chromiumoxide::cdp::browser_protocol::page::GetFrameTreeParams;
 
+    let snapshot_id = Uuid::new_v4().to_string();
     debug!("CDP: enabling Accessibility domain");
     let _ = page.execute(EnableParams {}).await;
 
@@ -186,7 +249,8 @@ async fn generate_snapshot_cdp_with_frames(page: &Page) -> Result<PageSnapshot> 
         debug!("CDP: frame {:?} has {} AX nodes", frame_id, ax_nodes.len());
 
         // Process nodes for this frame
-        let (nodes, counter) = process_ax_nodes(page, &ax_nodes, global_counter).await?;
+        let (nodes, counter) =
+            process_ax_nodes(page, &ax_nodes, global_counter, &snapshot_id).await?;
 
         if !nodes.is_empty() {
             if is_main {
@@ -263,7 +327,7 @@ async fn generate_snapshot_cdp_with_frames(page: &Page) -> Result<PageSnapshot> 
     );
 
     Ok(PageSnapshot {
-        snapshot_id: Uuid::new_v4().to_string(),
+        snapshot_id,
         url,
         title,
         nodes: all_nodes,
@@ -365,8 +429,9 @@ async fn process_ax_nodes(
     page: &Page,
     ax_nodes: &[chromiumoxide::cdp::browser_protocol::accessibility::AxNode],
     start_counter: u32,
+    snapshot_id: &str,
 ) -> Result<(Vec<SnapshotNode>, u32)> {
-    process_ax_nodes_impl(page, ax_nodes, start_counter, true).await
+    process_ax_nodes_impl(page, ax_nodes, start_counter, true, snapshot_id).await
 }
 
 /// 处理 AX 节点并构建树（用于 iframe 内部快照）
@@ -376,8 +441,9 @@ pub async fn process_ax_nodes_in_frame(
     page: &Page,
     ax_nodes: &[chromiumoxide::cdp::browser_protocol::accessibility::AxNode],
     start_counter: u32,
+    snapshot_id: &str,
 ) -> Result<(Vec<SnapshotNode>, u32)> {
-    process_ax_nodes_impl(page, ax_nodes, start_counter, true).await
+    process_ax_nodes_impl(page, ax_nodes, start_counter, true, snapshot_id).await
 }
 
 /// AX 节点处理的通用实现
@@ -388,6 +454,7 @@ async fn process_ax_nodes_impl(
     ax_nodes: &[chromiumoxide::cdp::browser_protocol::accessibility::AxNode],
     start_counter: u32,
     inject_refs: bool,
+    snapshot_id: &str,
 ) -> Result<(Vec<SnapshotNode>, u32)> {
     use chromiumoxide::cdp::browser_protocol::dom::{
         GetDocumentParams, PushNodesByBackendIdsToFrontendParams, SetAttributeValueParams,
@@ -407,11 +474,9 @@ async fn process_ax_nodes_impl(
         let ref_id = format!("ax{}", counter);
         ax_id_to_ref.insert(String::from(node.node_id.as_ref()), ref_id.clone());
 
-        if inject_refs {
-            if let Some(backend_id) = node.backend_dom_node_id {
-                backend_ids.push(backend_id);
-                ref_ids_for_backend.push(ref_id);
-            }
+        if inject_refs && let Some(backend_id) = node.backend_dom_node_id {
+            backend_ids.push(backend_id);
+            ref_ids_for_backend.push(ref_id);
         }
     }
 
@@ -442,6 +507,17 @@ async fn process_ax_nodes_impl(
                         .await
                     {
                         warn!("SetAttributeValue failed for {ref_id}: {error}");
+                        continue;
+                    }
+                    if let Err(error) = page
+                        .execute(SetAttributeValueParams {
+                            node_id: *node_id,
+                            name: "data-agent-snapshot".to_string(),
+                            value: snapshot_id.to_string(),
+                        })
+                        .await
+                    {
+                        warn!("Snapshot binding failed for {ref_id}: {error}");
                     }
                 }
             }
@@ -588,15 +664,16 @@ fn extract_ax_str(
 /// JS 快照代码（支持 iframe）
 const GET_AX_TREE_WITH_IFRAMES_JS: &str = r#"
 (() => {
+    const snapshotId = __AGENT_SNAPSHOT_ID__;
     let refCounter = parseInt(document.body?.getAttribute('data-agent-counter') || '0', 10);
     let iframeCounter = 0;
 
     function getOrAssignRefId(element) {
         const existing = element.getAttribute('data-agent-ref');
-        if (existing) return existing;
-        const refId = 'e' + (++refCounter);
+        const refId = existing || ('e' + (++refCounter));
         try {
             element.setAttribute('data-agent-ref', refId);
+            element.setAttribute('data-agent-snapshot', snapshotId);
         } catch (e) {}
         return refId;
     }
@@ -864,9 +941,14 @@ const GET_AX_TREE_WITH_IFRAMES_JS: &str = r#"
 /// JS 方式生成快照（支持 iframe）
 async fn generate_snapshot_js_with_frames(page: &Page) -> Result<PageSnapshot> {
     debug!("JS fallback: generating snapshot with iframe support");
+    let snapshot_id = Uuid::new_v4().to_string();
+    let script = GET_AX_TREE_WITH_IFRAMES_JS.replace(
+        "__AGENT_SNAPSHOT_ID__",
+        &serde_json::to_string(&snapshot_id)?,
+    );
 
     let result: serde_json::Value = page
-        .evaluate(GET_AX_TREE_WITH_IFRAMES_JS)
+        .evaluate(script)
         .await
         .map_err(|e| Error::JavaScript(e.to_string()))?
         .into_value()
@@ -892,7 +974,7 @@ async fn generate_snapshot_js_with_frames(page: &Page) -> Result<PageSnapshot> {
     );
 
     Ok(PageSnapshot {
-        snapshot_id: Uuid::new_v4().to_string(),
+        snapshot_id,
         url,
         title,
         nodes,
@@ -943,9 +1025,210 @@ fn collect_by_role<'a>(nodes: &'a [SnapshotNode], role: &str, out: &mut Vec<&'a 
     }
 }
 
+/// Return a bounded snapshot suitable for an agent context window.
+pub fn compact_snapshot(snapshot: &PageSnapshot, options: &SnapshotOptions) -> PageSnapshot {
+    let source = options
+        .root_ref
+        .as_deref()
+        .and_then(|ref_id| find_node_by_ref(&snapshot.nodes, ref_id))
+        .map(|node| vec![node.clone()])
+        .unwrap_or_else(|| snapshot.nodes.clone());
+    let mut remaining = options.max_nodes.max(1);
+    let nodes = compact_nodes(&source, options, 0, &mut remaining);
+    PageSnapshot {
+        snapshot_id: snapshot.snapshot_id.clone(),
+        url: snapshot.url.clone(),
+        title: snapshot.title.clone(),
+        nodes,
+        timestamp: snapshot.timestamp,
+        iframe_count: snapshot.iframe_count,
+        iframe_mappings: snapshot.iframe_mappings.clone(),
+    }
+}
+
+fn compact_nodes(
+    nodes: &[SnapshotNode],
+    options: &SnapshotOptions,
+    depth: usize,
+    remaining: &mut usize,
+) -> Vec<SnapshotNode> {
+    if *remaining == 0 || options.max_depth.is_some_and(|max| depth > max) {
+        return Vec::new();
+    }
+    let mut output = Vec::new();
+    for node in nodes {
+        if *remaining == 0 {
+            break;
+        }
+        if options.interactive_only
+            && !is_actionable_node(node)
+            && !node.children.iter().any(|child| {
+                subtree_has_actionable(child, options.max_depth, depth.saturating_add(1))
+            })
+        {
+            continue;
+        }
+        // Reserve the ancestor before descending so a tight node budget never
+        // returns orphaned descendants or an empty tree.
+        *remaining -= 1;
+        let mut compact = node.clone();
+        compact.children = compact_nodes(&node.children, options, depth + 1, remaining);
+        output.push(compact);
+    }
+    output
+}
+
+fn subtree_has_actionable(node: &SnapshotNode, max_depth: Option<usize>, depth: usize) -> bool {
+    if max_depth.is_some_and(|max| depth > max) {
+        return false;
+    }
+    is_actionable_node(node)
+        || node
+            .children
+            .iter()
+            .any(|child| subtree_has_actionable(child, max_depth, depth.saturating_add(1)))
+}
+
+fn is_actionable_node(node: &SnapshotNode) -> bool {
+    const ACTIONABLE_ROLES: &[&str] = &[
+        "button",
+        "link",
+        "checkbox",
+        "radio",
+        "combobox",
+        "textbox",
+        "searchbox",
+        "slider",
+        "spinbutton",
+        "menuitem",
+        "tab",
+        "option",
+        "switch",
+        "iframe",
+    ];
+    ACTIONABLE_ROLES.contains(&node.role.as_str())
+        || node
+            .attributes
+            .get("interactive")
+            .is_some_and(|value| value == "true")
+}
+
+/// Search the latest accessibility snapshot without returning the whole tree.
+pub fn search_snapshot(
+    snapshot: &PageSnapshot,
+    query: &str,
+    max_results: usize,
+) -> SnapshotSearchResult {
+    let query = query.to_ascii_lowercase();
+    let mut matches = Vec::new();
+    collect_search_matches(
+        &snapshot.nodes,
+        &query,
+        "root",
+        max_results.max(1),
+        &mut matches,
+    );
+    SnapshotSearchResult {
+        snapshot_id: snapshot.snapshot_id.clone(),
+        matches,
+    }
+}
+
+fn collect_search_matches(
+    nodes: &[SnapshotNode],
+    query: &str,
+    parent_path: &str,
+    max_results: usize,
+    output: &mut Vec<SnapshotNodeSummary>,
+) {
+    for (index, node) in nodes.iter().enumerate() {
+        if output.len() >= max_results {
+            return;
+        }
+        let path = format!("{parent_path}/{index}:{}", node.role);
+        if node.name.to_ascii_lowercase().contains(query)
+            || node.role.to_ascii_lowercase().contains(query)
+            || node
+                .value
+                .as_deref()
+                .is_some_and(|value| value.to_ascii_lowercase().contains(query))
+        {
+            output.push(SnapshotNodeSummary {
+                ref_id: node.ref_id.clone(),
+                role: node.role.clone(),
+                name: node.name.clone(),
+                path: path.clone(),
+            });
+        }
+        collect_search_matches(&node.children, query, &path, max_results, output);
+    }
+}
+
+/// Compute a structural delta between consecutive snapshots.
+pub fn diff_snapshots(previous: &PageSnapshot, current: &PageSnapshot) -> SnapshotDiff {
+    let mut old = HashMap::new();
+    let mut new = HashMap::new();
+    collect_diff_nodes(&previous.nodes, "root", &mut old);
+    collect_diff_nodes(&current.nodes, "root", &mut new);
+
+    let added = new
+        .iter()
+        .filter(|(key, _)| !old.contains_key(*key))
+        .map(|(_, (summary, _))| summary.clone())
+        .collect();
+    let removed = old
+        .iter()
+        .filter(|(key, _)| !new.contains_key(*key))
+        .map(|(_, (summary, _))| summary.clone())
+        .collect();
+    let changed = new
+        .iter()
+        .filter_map(|(key, (summary, fingerprint))| {
+            old.get(key)
+                .filter(|(_, old_fingerprint)| old_fingerprint != fingerprint)
+                .map(|_| summary.clone())
+        })
+        .collect();
+
+    SnapshotDiff {
+        from_snapshot_id: previous.snapshot_id.clone(),
+        to_snapshot_id: current.snapshot_id.clone(),
+        added,
+        removed,
+        changed,
+    }
+}
+
+fn collect_diff_nodes(
+    nodes: &[SnapshotNode],
+    parent_path: &str,
+    output: &mut HashMap<String, (SnapshotNodeSummary, String)>,
+) {
+    for (index, node) in nodes.iter().enumerate() {
+        let path = format!("{parent_path}/{index}:{}", node.role);
+        let fingerprint =
+            serde_json::to_string(&(&node.name, &node.value, &node.description, &node.attributes))
+                .unwrap_or_default();
+        output.insert(
+            path.clone(),
+            (
+                SnapshotNodeSummary {
+                    ref_id: node.ref_id.clone(),
+                    role: node.role.clone(),
+                    name: node.name.clone(),
+                    path: path.clone(),
+                },
+                fingerprint,
+            ),
+        );
+        collect_diff_nodes(&node.children, &path, output);
+    }
+}
+
 /// 格式化快照为可读文本
 pub fn format_snapshot(snapshot: &PageSnapshot) -> String {
     let mut output = String::new();
+    output.push_str(&format!("快照: {}\n", snapshot.snapshot_id));
     output.push_str(&format!("页面: {}\n", snapshot.url));
     output.push_str(&format!("标题: {}\n", snapshot.title));
     if snapshot.iframe_count > 0 {
@@ -1109,6 +1392,33 @@ mod tests {
 
         let buttons = find_nodes_by_role(&nodes, "button");
         assert_eq!(buttons.len(), 2);
+    }
+
+    #[test]
+    fn compact_snapshot_reserves_budget_for_ancestors() {
+        let button = create_test_node("ax2", "button", "Submit");
+        let root = create_test_node_with_children("ax1", "main", "Page", vec![button]);
+        let snapshot = PageSnapshot {
+            snapshot_id: "snapshot-1".to_string(),
+            url: "https://example.com".to_string(),
+            title: "Example".to_string(),
+            nodes: vec![root],
+            timestamp: 0,
+            iframe_count: 0,
+            iframe_mappings: Vec::new(),
+        };
+        let compact = compact_snapshot(
+            &snapshot,
+            &SnapshotOptions {
+                interactive_only: true,
+                root_ref: None,
+                max_depth: Some(8),
+                max_nodes: 2,
+            },
+        );
+
+        assert_eq!(count_nodes(&compact.nodes), 2);
+        assert_eq!(compact.nodes[0].children[0].ref_id, "ax2");
     }
 
     #[test]

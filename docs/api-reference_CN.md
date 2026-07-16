@@ -18,10 +18,13 @@ Agent Browser 实现 [MCP 2025-11-25](https://modelcontextprotocol.io/specificat
 | **Resources** | 截图和快照作为资源访问 |
 | **Prompts** | 预定义提示词用于常见任务 |
 | **Logging** | 可配置的日志级别 |
+| **Tasks** | 支持 get/list/result/cancel 的持久工具任务 |
 
 ## MCP 工具
 
 Agent Browser 为 AI Agent 提供 30+ MCP 工具。
+
+基于引用的工具（点击、输入、按键、滚动、上传、进入 iframe、点击下载）必须同时传入 `browser_snapshot` 返回的 `snapshot_id` 和 `ref_id`。生成新快照后，旧引用会失效。
 
 ### 工具注解
 
@@ -103,6 +106,12 @@ Agent Browser 为 AI Agent 提供 30+ MCP 工具。
 |----------|------|-----------|
 | `resource://browser/screenshot` | 当前页面截图 | `image/png` |
 | `resource://browser/snapshot` | Accessibility Tree 快照 | `text/plain` |
+
+## MCP Tasks、进度与取消
+
+支持后台执行的工具会声明 `execution.taskSupport: "optional"`。在 `tools/call` 中传入 `task: {"ttl": 600000}` 后，可使用 `tasks/get`、`tasks/list`、`tasks/result`、`tasks/cancel`。携带 `_meta.progressToken` 的请求会收到 `notifications/progress`；`notifications/cancelled` 会中止对应的进行中 JSON-RPC 请求。
+
+可通过 `BROWSER_MCP_CAPS` 配置 `network`、`storage`、`files`、`devtools` 的逗号分隔子集。禁用的工具既不会被列出，也不能直接调用。
 
 ### 读取资源
 
@@ -189,6 +198,10 @@ http://localhost:3000
 curl -H "X-API-Key: YOUR_API_KEY" http://localhost:3000/snapshot
 ```
 
+### 隔离会话
+
+通过 `POST /sessions` 创建会话，随后在浏览器请求中使用 `X-Browser-Session` 传入会话 ID。`GET /sessions` 列出会话，`DELETE /sessions/{id}` 关闭会话；不传 Header 时使用默认会话。
+
 ### 端点
 
 #### 导航
@@ -251,7 +264,7 @@ curl http://localhost:3000/snapshot
 ```bash
 curl -X POST http://localhost:3000/act \
   -H "Content-Type: application/json" \
-  -d '{"ref_id": "ax1", "action": "click"}'
+  -d '{"snapshot_id": "SNAPSHOT_ID", "ref_id": "ax1", "action": "click"}'
 ```
 
 **操作类型：**
@@ -606,7 +619,7 @@ ws.onmessage = (event) => {
 浏览器自动化的主要入口点。
 
 ```rust
-use agent_browser_core::{BrowserEngine, BrowserConfig, HeadlessMode};
+use agent_browser_core::{ActionKind, BrowserEngine, BrowserConfig, HeadlessMode};
 
 // 创建引擎
 let engine = BrowserEngine::new(BrowserConfig::default());
@@ -620,8 +633,10 @@ engine.navigate("https://example.com").await?;
 // 获取快照
 let snapshot = engine.snapshot().await?;
 
-// 通过 ref_id 点击
-engine.click("ax1").await?;
+// 仅使用生成 ref_id 的快照执行点击
+engine
+    .act_with_snapshot(&snapshot.snapshot_id, "ax1", ActionKind::Click)
+    .await?;
 
 // 通过 CSS 选择器点击
 engine.click_selector("button.primary", None).await?;

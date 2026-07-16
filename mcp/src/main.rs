@@ -33,11 +33,16 @@
 //!   --help              Show help
 //! ```
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use agent_browser_core::snapshot::format_snapshot;
 use agent_browser_core::{BrowserConfig, BrowserEngine, ScreenshotOptions, SetCookieParam};
 use serde_json::{Value, json};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tracing::{info, warn};
 
 mod protocol;
@@ -55,13 +60,29 @@ use tools::*;
 struct ServerState {
     browser: BrowserEngine,
     initialized: std::sync::atomic::AtomicBool,
+    notification_tx: mpsc::UnboundedSender<JsonRpcNotification>,
+    tasks: Mutex<HashMap<String, Arc<TaskEntry>>>,
+}
+
+struct TaskEntry {
+    runtime: Mutex<TaskRuntime>,
+    notify: Notify,
+}
+
+struct TaskRuntime {
+    descriptor: TaskDescriptor,
+    result: Option<Value>,
+    abort_handle: Option<tokio::task::AbortHandle>,
+    expires_at: Option<tokio::time::Instant>,
 }
 
 impl ServerState {
-    fn new() -> Self {
+    fn new(notification_tx: mpsc::UnboundedSender<JsonRpcNotification>) -> Self {
         Self {
-            browser: BrowserEngine::new(BrowserConfig::default()),
+            browser: BrowserEngine::new(BrowserConfig::from_env()),
             initialized: std::sync::atomic::AtomicBool::new(false),
+            notification_tx,
+            tasks: Mutex::new(HashMap::new()),
         }
     }
 
@@ -72,6 +93,61 @@ impl ServerState {
     fn set_initialized(&self) {
         self.initialized
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn send_progress(&self, token: &Value, progress: f64, total: f64, message: &str) {
+        let _ = self.notification_tx.send(JsonRpcNotification::new(
+            "notifications/progress",
+            Some(json!({
+                "progressToken": token,
+                "progress": progress,
+                "total": total,
+                "message": message,
+            })),
+        ));
+    }
+
+    async fn get_task(&self, task_id: &str) -> Option<Arc<TaskEntry>> {
+        let entry = self.tasks.lock().await.get(task_id).cloned()?;
+        let expired = entry
+            .runtime
+            .lock()
+            .await
+            .expires_at
+            .is_some_and(|expires_at| expires_at <= tokio::time::Instant::now());
+        if expired {
+            self.tasks.lock().await.remove(task_id);
+            None
+        } else {
+            Some(entry)
+        }
+    }
+
+    async fn prune_tasks(&self) {
+        let entries = self
+            .tasks
+            .lock()
+            .await
+            .iter()
+            .map(|(task_id, entry)| (task_id.clone(), entry.clone()))
+            .collect::<Vec<_>>();
+        let now = tokio::time::Instant::now();
+        let mut expired = Vec::new();
+        for (task_id, entry) in entries {
+            if entry
+                .runtime
+                .lock()
+                .await
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= now)
+            {
+                expired.push(task_id);
+            }
+        }
+        let mut tasks = self.tasks.lock().await;
+        for task_id in expired {
+            tasks.remove(&task_id);
+        }
     }
 }
 
@@ -189,15 +265,29 @@ async fn run_stdio_server() -> anyhow::Result<()> {
         MCP_PROTOCOL_VERSION
     );
 
-    let state = Arc::new(ServerState::new());
     let transport = transport::stdio::StdioTransport::new();
+    let (notification_tx, mut notification_rx) = mpsc::unbounded_channel();
+    let state = Arc::new(ServerState::new(notification_tx));
+
+    let notification_transport = transport.clone();
+    tokio::spawn(async move {
+        while let Some(notification) = notification_rx.recv().await {
+            if let Err(error) = notification_transport
+                .write_notification(&notification)
+                .await
+            {
+                warn!("Failed to send MCP notification: {error}");
+                break;
+            }
+        }
+    });
 
     let notification_state = state.clone();
     transport
         .run(
-            |request| {
+            move |request| {
                 let state = state.clone();
-                async move { handle_request(&state, request).await }
+                async move { handle_request(state, request).await }
             },
             move |notification| handle_notification(&notification_state, &notification),
         )
@@ -205,7 +295,7 @@ async fn run_stdio_server() -> anyhow::Result<()> {
 }
 
 /// 处理 MCP 请求
-async fn handle_request(state: &ServerState, request: JsonRpcRequest) -> JsonRpcResponse {
+async fn handle_request(state: Arc<ServerState>, request: JsonRpcRequest) -> JsonRpcResponse {
     let id = request.id.clone();
 
     if !matches!(request.method.as_str(), "initialize" | "ping") && !state.is_initialized() {
@@ -225,12 +315,21 @@ async fn handle_request(state: &ServerState, request: JsonRpcRequest) -> JsonRpc
         // ── 工具 ─────────────────────────────────────────────────────────────
         "tools/list" => handle_tools_list(id),
 
-        "tools/call" => handle_tools_call(state, id, request.params).await,
+        "tools/call" => handle_tools_call(&state, id, request.params).await,
+
+        // ── Durable tasks ───────────────────────────────────────────────────
+        "tasks/get" => handle_task_get(&state, id, request.params).await,
+
+        "tasks/list" => handle_tasks_list(&state, id).await,
+
+        "tasks/result" => handle_task_result(&state, id, request.params).await,
+
+        "tasks/cancel" => handle_task_cancel(&state, id, request.params).await,
 
         // ── 资源 ─────────────────────────────────────────────────────────────
         "resources/list" => handle_resources_list(id),
 
-        "resources/read" => handle_resources_read(state, id, request.params).await,
+        "resources/read" => handle_resources_read(&state, id, request.params).await,
 
         // ── 提示词 ───────────────────────────────────────────────────────────
         "prompts/list" => handle_prompts_list(id),
@@ -306,6 +405,11 @@ fn handle_initialize(id: Option<Value>, params: Option<Value>) -> JsonRpcRespons
             }),
             logging: Some(LoggingCapability {}),
             completions: None,
+            tasks: Some(json!({
+                "list": {},
+                "cancel": {},
+                "requests": {"tools": {"call": {}}}
+            })),
             experimental: None,
         },
         server_info: Some(ServerInfo {
@@ -346,7 +450,7 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
 
 /// 处理 tools/call 请求
 async fn handle_tools_call(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     id: Option<Value>,
     params: Option<Value>,
 ) -> JsonRpcResponse {
@@ -379,17 +483,61 @@ async fn handle_tools_call(
             );
         }
     };
+    let progress_token = params
+        .meta
+        .as_ref()
+        .and_then(|meta| meta.progress_token.clone());
 
-    if params.name == "browser_screenshot" {
-        return handle_screenshot_tool(state, id, &arguments_map).await;
+    if !is_tool_enabled(&params.name) {
+        return JsonRpcResponse::error_response(
+            id,
+            ERR_METHOD_NOT_FOUND,
+            &format!(
+                "Tool is unavailable under BROWSER_MCP_CAPS: {}",
+                params.name
+            ),
+        );
     }
 
-    match execute_tool(state, &params.name, arguments_map).await {
+    if let Some(token) = &progress_token {
+        state.send_progress(token, 0.0, 1.0, "Tool execution started");
+    }
+
+    if let Some(task_request) = params.task {
+        if !is_task_supported(&params.name) {
+            return JsonRpcResponse::error_response(
+                id,
+                ERR_INVALID_PARAMS,
+                &format!("Tool does not support task execution: {}", params.name),
+            );
+        }
+        let task = start_tool_task(
+            state.clone(),
+            params.name,
+            arguments_map,
+            task_request,
+            progress_token,
+        )
+        .await;
+        return JsonRpcResponse::success(id, json!({"task": task}));
+    }
+
+    if params.name == "browser_screenshot" {
+        let response = handle_screenshot_tool(state, id, &arguments_map).await;
+        if let Some(token) = &progress_token {
+            state.send_progress(token, 1.0, 1.0, "Tool execution completed");
+        }
+        return response;
+    }
+
+    let response = match execute_tool(state, &params.name, arguments_map).await {
         Ok(result) => {
+            let text = serde_json::to_string_pretty(&result)
+                .unwrap_or_else(|_| "Tool completed".to_string());
             let tool_result = ToolCallResult {
-                content: vec![Content::text(result)],
+                content: vec![Content::text(text)],
                 is_error: false,
-                structured_content: None,
+                structured_content: Some(result),
             };
             match serde_json::to_value(tool_result) {
                 Ok(value) => JsonRpcResponse::success(id, value),
@@ -415,7 +563,11 @@ async fn handle_tools_call(
                 ),
             }
         }
+    };
+    if let Some(token) = &progress_token {
+        state.send_progress(token, 1.0, 1.0, "Tool execution completed");
     }
+    response
 }
 
 async fn handle_screenshot_tool(
@@ -470,6 +622,262 @@ async fn handle_screenshot_tool(
             &format!("Serialization error: {error}"),
         ),
     }
+}
+
+async fn start_tool_task(
+    state: Arc<ServerState>,
+    tool_name: String,
+    arguments: serde_json::Map<String, Value>,
+    request: TaskRequest,
+    progress_token: Option<Value>,
+) -> TaskDescriptor {
+    let ttl = request.ttl.unwrap_or(600_000).clamp(1_000, 86_400_000);
+    let now = now_rfc3339();
+    let descriptor = TaskDescriptor {
+        task_id: uuid::Uuid::new_v4().to_string(),
+        status: "working".to_string(),
+        status_message: Some(format!("Running {tool_name}")),
+        created_at: now.clone(),
+        last_updated_at: now,
+        ttl,
+        poll_interval: Some(500),
+    };
+    let entry = Arc::new(TaskEntry {
+        runtime: Mutex::new(TaskRuntime {
+            descriptor: descriptor.clone(),
+            result: None,
+            abort_handle: None,
+            expires_at: None,
+        }),
+        notify: Notify::new(),
+    });
+    state
+        .tasks
+        .lock()
+        .await
+        .insert(descriptor.task_id.clone(), entry.clone());
+
+    let task_state = state.clone();
+    let task_entry = entry.clone();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = start_rx.await;
+        let outcome = execute_tool(&task_state, &tool_name, arguments).await;
+        let (status, status_message, result) = match outcome {
+            Ok(value) => (
+                "completed",
+                Some(format!("Completed {tool_name}")),
+                tool_call_result_value(Ok(value)),
+            ),
+            Err(error) => {
+                let message = error.to_string();
+                (
+                    "failed",
+                    Some(message.clone()),
+                    tool_call_result_value(Err(message)),
+                )
+            }
+        };
+
+        let mut runtime = task_entry.runtime.lock().await;
+        if runtime.descriptor.status == "working" {
+            runtime.descriptor.status = status.to_string();
+            runtime.descriptor.status_message = status_message;
+            runtime.descriptor.last_updated_at = now_rfc3339();
+            runtime.result = Some(result);
+            runtime.abort_handle = None;
+            runtime.expires_at = Some(
+                tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(runtime.descriptor.ttl),
+            );
+        }
+        drop(runtime);
+        task_entry.notify.notify_waiters();
+        if let Some(token) = progress_token {
+            task_state.send_progress(
+                &token,
+                1.0,
+                1.0,
+                if status == "completed" {
+                    "Task completed"
+                } else {
+                    "Task failed"
+                },
+            );
+        }
+    });
+    entry.runtime.lock().await.abort_handle = Some(task.abort_handle());
+    let _ = start_tx.send(());
+    descriptor
+}
+
+async fn handle_task_get(
+    state: &ServerState,
+    id: Option<Value>,
+    params: Option<Value>,
+) -> JsonRpcResponse {
+    let params = match parse_task_id_params(params) {
+        Ok(params) => params,
+        Err(message) => {
+            return JsonRpcResponse::error_response(id, ERR_INVALID_PARAMS, message);
+        }
+    };
+    let Some(entry) = state.get_task(&params.task_id).await else {
+        return task_not_found(id, &params.task_id);
+    };
+    let descriptor = entry.runtime.lock().await.descriptor.clone();
+    JsonRpcResponse::success(id, json!({"task": descriptor}))
+}
+
+async fn handle_tasks_list(state: &ServerState, id: Option<Value>) -> JsonRpcResponse {
+    state.prune_tasks().await;
+    let entries = state
+        .tasks
+        .lock()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut tasks = Vec::with_capacity(entries.len());
+    for entry in entries {
+        tasks.push(entry.runtime.lock().await.descriptor.clone());
+    }
+    JsonRpcResponse::success(id, json!({"tasks": tasks}))
+}
+
+async fn handle_task_result(
+    state: &ServerState,
+    id: Option<Value>,
+    params: Option<Value>,
+) -> JsonRpcResponse {
+    let params = match parse_task_id_params(params) {
+        Ok(params) => params,
+        Err(message) => {
+            return JsonRpcResponse::error_response(id, ERR_INVALID_PARAMS, message);
+        }
+    };
+    let Some(entry) = state.get_task(&params.task_id).await else {
+        return task_not_found(id, &params.task_id);
+    };
+
+    loop {
+        let notified = entry.notify.notified();
+        let runtime = entry.runtime.lock().await;
+        match runtime.descriptor.status.as_str() {
+            "completed" | "failed" => {
+                return JsonRpcResponse::success(
+                    id,
+                    runtime.result.clone().unwrap_or_else(|| json!({})),
+                );
+            }
+            "cancelled" => {
+                return JsonRpcResponse::error_response(
+                    id,
+                    ERR_INVALID_REQUEST,
+                    "Task was cancelled before producing a result",
+                );
+            }
+            _ => {}
+        }
+        drop(runtime);
+        notified.await;
+    }
+}
+
+async fn handle_task_cancel(
+    state: &ServerState,
+    id: Option<Value>,
+    params: Option<Value>,
+) -> JsonRpcResponse {
+    let params = match parse_task_id_params(params) {
+        Ok(params) => params,
+        Err(message) => {
+            return JsonRpcResponse::error_response(id, ERR_INVALID_PARAMS, message);
+        }
+    };
+    let Some(entry) = state.get_task(&params.task_id).await else {
+        return task_not_found(id, &params.task_id);
+    };
+
+    let mut runtime = entry.runtime.lock().await;
+    if runtime.descriptor.status == "working" {
+        runtime.descriptor.status = "cancelled".to_string();
+        runtime.descriptor.status_message = Some("Cancelled by client".to_string());
+        runtime.descriptor.last_updated_at = now_rfc3339();
+        if let Some(handle) = runtime.abort_handle.take() {
+            handle.abort();
+        }
+        runtime.expires_at = Some(
+            tokio::time::Instant::now() + std::time::Duration::from_millis(runtime.descriptor.ttl),
+        );
+    }
+    let descriptor = runtime.descriptor.clone();
+    drop(runtime);
+    entry.notify.notify_waiters();
+    JsonRpcResponse::success(id, json!({"task": descriptor}))
+}
+
+fn parse_task_id_params(params: Option<Value>) -> std::result::Result<TaskIdParams, &'static str> {
+    params
+        .and_then(|params| serde_json::from_value(params).ok())
+        .ok_or("Missing or invalid taskId")
+}
+
+fn task_not_found(id: Option<Value>, task_id: &str) -> JsonRpcResponse {
+    JsonRpcResponse::error_response(
+        id,
+        ERR_RESOURCE_NOT_FOUND,
+        &format!("Task not found: {task_id}"),
+    )
+}
+
+fn tool_call_result_value(result: std::result::Result<Value, String>) -> Value {
+    let result = match result {
+        Ok(value) => ToolCallResult {
+            content: vec![Content::text(
+                serde_json::to_string_pretty(&value)
+                    .unwrap_or_else(|_| "Tool completed".to_string()),
+            )],
+            is_error: false,
+            structured_content: Some(value),
+        },
+        Err(error) => ToolCallResult {
+            content: vec![Content::text(format!("Error: {error}"))],
+            is_error: true,
+            structured_content: None,
+        },
+    };
+    serde_json::to_value(result).unwrap_or_else(|_| json!({"isError": true}))
+}
+
+fn now_rfc3339() -> String {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let seconds = duration.as_secs() as i64;
+    let millis = duration.subsec_millis();
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let days = days_since_epoch + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 
 /// 处理 resources/list 请求
@@ -752,166 +1160,219 @@ async fn execute_tool(
     state: &ServerState,
     tool_name: &str,
     arguments: serde_json::Map<String, Value>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Value> {
     match tool_name {
         "browser_navigate" => {
-            let url = arguments["url"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter"))?;
+            let url = required_string(&arguments, "url")?;
             let result = state.browser.navigate(url).await?;
-            Ok(format!(
-                "Navigated to {}\nTitle: {}\nFinal URL: {}",
-                result.url, result.title, result.final_url
-            ))
+            Ok(serde_json::to_value(result)?)
         }
 
         "browser_snapshot" => {
-            let snapshot = state.browser.snapshot().await?;
-            Ok(format_snapshot(&snapshot))
+            let defaults = agent_browser_core::SnapshotOptions::default();
+            let snapshot = state
+                .browser
+                .snapshot_with_options(agent_browser_core::SnapshotOptions {
+                    interactive_only: arguments
+                        .get("interactive_only")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(defaults.interactive_only),
+                    root_ref: arguments
+                        .get("root_ref")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    max_depth: arguments
+                        .get("max_depth")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as usize)
+                        .or(defaults.max_depth),
+                    max_nodes: arguments
+                        .get("max_nodes")
+                        .and_then(Value::as_u64)
+                        .map(|value| value as usize)
+                        .unwrap_or(defaults.max_nodes)
+                        .clamp(1, 5_000),
+                })
+                .await?;
+            Ok(serde_json::to_value(snapshot)?)
+        }
+
+        "browser_snapshot_search" => {
+            let query = required_string(&arguments, "query")?;
+            let result = state
+                .browser
+                .search_snapshot(
+                    query,
+                    arguments
+                        .get("max_results")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(20) as usize,
+                )
+                .await?;
+            Ok(serde_json::to_value(result)?)
         }
 
         "browser_click" => {
-            let ref_id = arguments["ref_id"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'ref_id' parameter"))?;
-            let result = state.browser.click(ref_id).await?;
-            Ok(result.message)
+            execute_snapshot_action(state, &arguments, agent_browser_core::ActionKind::Click).await
         }
 
         "browser_type" => {
-            let ref_id = arguments["ref_id"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'ref_id' parameter"))?;
-            let text = arguments["text"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'text' parameter"))?;
-            let clear_first = arguments["clear_first"].as_bool().unwrap_or(false);
-            let result = state.browser.type_text(ref_id, text, clear_first).await?;
-            Ok(result.message)
+            let text = required_string(&arguments, "text")?.to_string();
+            execute_snapshot_action(
+                state,
+                &arguments,
+                agent_browser_core::ActionKind::Type {
+                    text,
+                    clear_first: arguments.get("clear_first").and_then(Value::as_bool),
+                },
+            )
+            .await
         }
 
         "browser_press" => {
-            let ref_id = arguments["ref_id"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'ref_id' parameter"))?;
-            let key = arguments["key"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'key' parameter"))?;
-            let result = state.browser.press(ref_id, key).await?;
-            Ok(result.message)
+            let key = required_string(&arguments, "key")?.to_string();
+            execute_snapshot_action(
+                state,
+                &arguments,
+                agent_browser_core::ActionKind::Press { key },
+            )
+            .await
         }
 
         "browser_scroll" => {
-            let direction = arguments["direction"].as_str().unwrap_or("down");
-            let amount = arguments["amount"].as_i64().unwrap_or(300) as i32;
-            let result = state.browser.scroll(direction, amount).await?;
-            Ok(result.message)
+            let direction = arguments
+                .get("direction")
+                .and_then(Value::as_str)
+                .unwrap_or("down")
+                .to_string();
+            let amount = arguments
+                .get("amount")
+                .and_then(Value::as_i64)
+                .unwrap_or(300) as i32;
+            execute_snapshot_action(
+                state,
+                &arguments,
+                agent_browser_core::ActionKind::Scroll {
+                    direction: Some(direction),
+                    amount: Some(amount),
+                },
+            )
+            .await
         }
 
         "browser_wait" => {
-            let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(1000);
-            let selector = arguments["selector"].as_str();
+            let timeout_ms = arguments
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(1000);
+            let selector = arguments.get("selector").and_then(Value::as_str);
 
             if let Some(sel) = selector {
                 state.browser.wait_for_selector(sel, timeout_ms).await?;
-                Ok(format!("Element '{}' appeared", sel))
+                Ok(json!({"ok": true, "selector": sel, "timeout_ms": timeout_ms}))
             } else {
                 state.browser.wait(timeout_ms).await?;
-                Ok(format!("Waited {}ms", timeout_ms))
+                Ok(json!({"ok": true, "waited_ms": timeout_ms}))
             }
         }
 
         "browser_evaluate" => {
-            let script = arguments["script"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'script' parameter"))?;
+            let script = required_string(&arguments, "script")?;
             let result = state.browser.evaluate(script).await?;
-            Ok(serde_json::to_string_pretty(&result)?)
+            Ok(json!({"value": result}))
         }
 
         "browser_get_cookies" => {
             let cookies = state.browser.get_cookies().await?;
-            Ok(serde_json::to_string_pretty(&cookies)?)
+            Ok(json!({"cookies": cookies}))
         }
 
         "browser_set_cookies" => {
-            let cookies_value = arguments["cookies"].clone();
+            let cookies_value = arguments
+                .get("cookies")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Missing 'cookies' parameter"))?;
             let cookies: Vec<SetCookieParam> = serde_json::from_value(cookies_value)?;
             state.browser.set_cookies(cookies).await?;
-            Ok("Cookies set successfully".to_string())
+            Ok(json!({"ok": true}))
         }
 
         "browser_list_tabs" => {
             let tabs = state.browser.list_tabs().await?;
-            Ok(serde_json::to_string_pretty(&tabs)?)
+            Ok(json!({"tabs": tabs}))
         }
 
         "browser_activate_tab" => {
-            let tab_id = arguments["tab_id"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'tab_id' parameter"))?;
+            let tab_id = required_string(&arguments, "tab_id")?;
             state.browser.activate_tab(tab_id).await?;
-            Ok(format!("Activated tab: {}", tab_id))
+            Ok(json!({"ok": true, "tab_id": tab_id}))
         }
 
         "browser_close_tab" => {
-            let tab_id = arguments["tab_id"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'tab_id' parameter"))?;
+            let tab_id = required_string(&arguments, "tab_id")?;
             state.browser.close_tab(tab_id).await?;
-            Ok(format!("Closed tab: {}", tab_id))
+            Ok(json!({"ok": true, "tab_id": tab_id}))
         }
 
         "browser_upload" => {
-            let ref_id = arguments["ref_id"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'ref_id' parameter"))?;
-            let file_path = arguments["file_path"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'file_path' parameter"))?;
-            state.browser.upload_file(ref_id, file_path).await?;
-            Ok(format!("File uploaded: {} -> {}", file_path, ref_id))
+            let snapshot_id = required_string(&arguments, "snapshot_id")?;
+            let ref_id = required_string(&arguments, "ref_id")?;
+            let file_path = required_string(&arguments, "file_path")?;
+            state
+                .browser
+                .upload_file_with_snapshot(snapshot_id, ref_id, file_path)
+                .await?;
+            Ok(json!({"ok": true, "ref_id": ref_id, "file_path": file_path}))
         }
 
         "browser_wait_for_network_idle" => {
-            let idle_ms = arguments["idle_ms"].as_u64().unwrap_or(500);
-            let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(30000);
+            let idle_ms = arguments
+                .get("idle_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(500);
+            let timeout_ms = arguments
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(30000);
             state
                 .browser
                 .wait_for_network_idle(idle_ms, timeout_ms)
                 .await?;
-            Ok("Network idle detected".to_string())
+            Ok(json!({"ok": true, "idle_ms": idle_ms, "timeout_ms": timeout_ms}))
         }
 
         "browser_shutdown" => {
             state.browser.shutdown().await?;
-            Ok("Browser closed".to_string())
+            Ok(json!({"ok": true}))
         }
 
         "browser_enter_iframe" => {
-            let ref_id = arguments["ref_id"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'ref_id' parameter"))?;
-            let depth = state.browser.enter_iframe(ref_id).await?;
-            Ok(format!("Entered iframe, depth: {}", depth))
+            let snapshot_id = required_string(&arguments, "snapshot_id")?;
+            let ref_id = required_string(&arguments, "ref_id")?;
+            let depth = state
+                .browser
+                .enter_iframe_with_snapshot(snapshot_id, ref_id)
+                .await?;
+            Ok(json!({"ok": true, "ref_id": ref_id, "depth": depth}))
         }
 
         "browser_exit_iframe" => {
             let depth = state.browser.exit_iframe().await?;
-            Ok(format!("Exited iframe, depth: {}", depth))
+            Ok(json!({"ok": true, "depth": depth}))
         }
 
         "browser_exit_all_iframes" => {
             state.browser.exit_all_iframes().await?;
-            Ok("Exited all iframes, returned to main document".to_string())
+            Ok(json!({"ok": true, "depth": 0}))
         }
 
         "browser_download_file" => {
-            let url = arguments["url"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter"))?;
-            let save_path = arguments["save_path"].as_str();
-            let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(60000);
+            let url = required_string(&arguments, "url")?;
+            let save_path = arguments.get("save_path").and_then(Value::as_str);
+            let timeout_ms = arguments
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(60000);
 
             let options = agent_browser_core::DownloadOptions {
                 save_path: save_path.map(|s| s.to_string()),
@@ -919,21 +1380,17 @@ async fn execute_tool(
             };
 
             let result = state.browser.download_file(url, Some(options)).await?;
-            Ok(format!(
-                "Download complete: {} -> {}\nSize: {} bytes\nStatus: {:?}",
-                result.guid,
-                result.file_path,
-                result.size.unwrap_or(0),
-                result.status
-            ))
+            Ok(serde_json::to_value(result)?)
         }
 
         "browser_click_and_download" => {
-            let ref_id = arguments["ref_id"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'ref_id' parameter"))?;
-            let save_path = arguments["save_path"].as_str();
-            let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(60000);
+            let snapshot_id = required_string(&arguments, "snapshot_id")?;
+            let ref_id = required_string(&arguments, "ref_id")?;
+            let save_path = arguments.get("save_path").and_then(Value::as_str);
+            let timeout_ms = arguments
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(60000);
 
             let options = agent_browser_core::DownloadOptions {
                 save_path: save_path.map(|s| s.to_string()),
@@ -942,24 +1399,17 @@ async fn execute_tool(
 
             let result = state
                 .browser
-                .click_and_download(ref_id, Some(options))
+                .click_and_download_with_snapshot(snapshot_id, ref_id, Some(options))
                 .await?;
-            Ok(format!(
-                "Download complete: {} -> {}\nSize: {} bytes\nStatus: {:?}",
-                result.guid,
-                result.file_path,
-                result.size.unwrap_or(0),
-                result.status
-            ))
+            Ok(serde_json::to_value(result)?)
         }
 
         "browser_press_key" => {
-            let key = arguments["key"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'key' parameter"))?;
+            let key = required_string(&arguments, "key")?;
 
-            let modifiers: Vec<agent_browser_core::KeyModifier> = arguments["modifiers"]
-                .as_array()
+            let modifiers: Vec<agent_browser_core::KeyModifier> = arguments
+                .get("modifiers")
+                .and_then(Value::as_array)
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|v| v.as_str())
@@ -977,22 +1427,21 @@ async fn execute_tool(
                 .unwrap_or_default();
 
             let result = state.browser.press_with_modifiers(key, &modifiers).await?;
-            Ok(result.message)
+            Ok(json!({"ok": result.success, "message": result.message}))
         }
 
         "browser_shortcut" => {
-            let shortcut = arguments["shortcut"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'shortcut' parameter"))?;
+            let shortcut = required_string(&arguments, "shortcut")?;
             let result = state.browser.send_shortcut(shortcut).await?;
-            Ok(result.message)
+            Ok(json!({"ok": result.success, "message": result.message}))
         }
 
         "browser_navigate_with_options" => {
-            let url = arguments["url"]
-                .as_str()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter"))?;
-            let wait_until = arguments["wait_until"].as_str().unwrap_or("load");
+            let url = required_string(&arguments, "url")?;
+            let wait_until = arguments
+                .get("wait_until")
+                .and_then(Value::as_str)
+                .unwrap_or("load");
 
             let wait_strategy = match wait_until {
                 "domContentLoaded" => agent_browser_core::NavigationWaitUntil::DomContentLoaded,
@@ -1005,52 +1454,56 @@ async fn execute_tool(
                 .browser
                 .navigate_with_options(url, wait_strategy)
                 .await?;
-            Ok(format!(
-                "Navigated to {} (wait: {})\nTitle: {}\nFinal URL: {}",
-                result.url, wait_until, result.title, result.final_url
-            ))
+            Ok(json!({
+                "url": result.url,
+                "title": result.title,
+                "final_url": result.final_url,
+                "wait_until": wait_until,
+            }))
         }
 
         "browser_enable_network_monitoring" => {
             state.browser.enable_network_monitoring().await?;
-            Ok("Network monitoring enabled".to_string())
+            Ok(json!({"ok": true}))
         }
 
         "browser_get_network_requests" => {
             let requests = state.browser.get_network_requests().await?;
-            Ok(serde_json::to_string_pretty(&requests)?)
+            Ok(json!({"requests": requests}))
         }
 
         "browser_clear_network_requests" => {
             state.browser.clear_network_requests().await?;
-            Ok("Network requests cleared".to_string())
+            Ok(json!({"ok": true}))
         }
 
         "browser_enable_console_monitoring" => {
             state.browser.enable_console_monitoring().await?;
-            Ok("Console monitoring enabled".to_string())
+            Ok(json!({"ok": true}))
         }
 
         "browser_get_console_messages" => {
             let messages = state.browser.get_console_messages().await?;
-            Ok(serde_json::to_string_pretty(&messages)?)
+            Ok(json!({"messages": messages}))
         }
 
         "browser_clear_console_messages" => {
             state.browser.clear_console_messages().await?;
-            Ok("Console messages cleared".to_string())
+            Ok(json!({"ok": true}))
         }
 
         "browser_set_viewport" => {
-            let width = arguments["width"]
-                .as_u64()
+            let width = arguments
+                .get("width")
+                .and_then(Value::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("Missing 'width' parameter"))?
                 as u32;
-            let height = arguments["height"]
-                .as_u64()
+            let height = arguments
+                .get("height")
+                .and_then(Value::as_u64)
                 .ok_or_else(|| anyhow::anyhow!("Missing 'height' parameter"))?
                 as u32;
-            let device_scale_factor = arguments["device_scale_factor"].as_f64();
+            let device_scale_factor = arguments.get("device_scale_factor").and_then(Value::as_f64);
 
             let viewport = agent_browser_core::ViewportSize {
                 width,
@@ -1059,21 +1512,139 @@ async fn execute_tool(
             };
 
             state.browser.set_viewport(&viewport).await?;
-            Ok(format!("Viewport set to {}x{}", width, height))
+            Ok(json!({"ok": true, "viewport": viewport}))
         }
 
         "browser_get_viewport" => {
             let viewport = state.browser.get_viewport_size().await?;
-            Ok(format!(
-                "Current viewport: {}x{}, device scale: {}",
-                viewport.width,
-                viewport.height,
-                viewport.device_scale_factor.unwrap_or(1.0)
-            ))
+            Ok(serde_json::to_value(viewport)?)
+        }
+
+        "browser_new_tab" => {
+            let url = required_string(&arguments, "url")?;
+            let tab = state.browser.new_tab(url).await?;
+            Ok(serde_json::to_value(tab)?)
+        }
+
+        "browser_find" => {
+            let strategy = required_string(&arguments, "strategy")?;
+            let query = required_string(&arguments, "query")?;
+            let timeout = arguments.get("timeout_ms").and_then(Value::as_u64);
+            let ref_id = match strategy {
+                "role" => {
+                    state
+                        .browser
+                        .find_by_role(
+                            query,
+                            arguments.get("name").and_then(Value::as_str),
+                            timeout,
+                        )
+                        .await?
+                }
+                "text" => state.browser.find_by_text(query, timeout).await?,
+                "label" => state.browser.find_by_label(query, timeout).await?,
+                _ => anyhow::bail!("Unknown find strategy: {strategy}"),
+            };
+            Ok(json!({
+                "ref_id": ref_id,
+                "snapshot_id": state.browser.current_snapshot_id().await,
+                "strategy": strategy,
+                "query": query,
+            }))
+        }
+
+        "browser_dialog" => {
+            let accept = arguments
+                .get("accept")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            state
+                .browser
+                .setup_dialog_handler(
+                    accept,
+                    arguments
+                        .get("prompt_text")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                )
+                .await?;
+            Ok(json!({"ok": true, "accept": accept}))
+        }
+
+        "browser_network" => {
+            let operation = required_string(&arguments, "operation")?;
+            match operation {
+                "block" => {
+                    let pattern = required_string(&arguments, "pattern")?;
+                    state.browser.intercept_requests(pattern, true).await?;
+                    Ok(json!({"ok": true, "operation": operation, "pattern": pattern}))
+                }
+                "unblock" => {
+                    let pattern = required_string(&arguments, "pattern")?;
+                    state.browser.intercept_requests(pattern, false).await?;
+                    Ok(json!({"ok": true, "operation": operation, "pattern": pattern}))
+                }
+                "clear" => {
+                    state.browser.disable_interception().await?;
+                    Ok(json!({"ok": true, "operation": operation}))
+                }
+                "list" => Ok(json!({
+                    "patterns": state.browser.blocked_request_patterns().await
+                })),
+                "response_body" => {
+                    let request_id = required_string(&arguments, "request_id")?;
+                    let body = state.browser.get_response_body(request_id).await?;
+                    Ok(json!({"request_id": request_id, "body": body}))
+                }
+                _ => anyhow::bail!("Unknown network operation: {operation}"),
+            }
+        }
+
+        "browser_emulate_device" => {
+            let device = required_string(&arguments, "device")?;
+            state.browser.emulate_device(device).await?;
+            Ok(json!({"ok": true, "device": device}))
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_name)),
     }
+}
+
+fn required_string<'a>(
+    arguments: &'a serde_json::Map<String, Value>,
+    name: &str,
+) -> anyhow::Result<&'a str> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Missing '{name}' parameter"))
+}
+
+async fn execute_snapshot_action(
+    state: &ServerState,
+    arguments: &serde_json::Map<String, Value>,
+    action: agent_browser_core::ActionKind,
+) -> anyhow::Result<Value> {
+    let snapshot_id = required_string(arguments, "snapshot_id")?;
+    let ref_id = arguments
+        .get("ref_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let result = state
+        .browser
+        .act_with_snapshot(snapshot_id, ref_id, action)
+        .await?;
+    let snapshot = state
+        .browser
+        .snapshot_with_options(agent_browser_core::SnapshotOptions::default())
+        .await?;
+    let diff = state.browser.latest_snapshot_diff().await;
+    Ok(json!({
+        "ok": result.success,
+        "message": result.message,
+        "snapshot": snapshot,
+        "diff": diff,
+    }))
 }
 
 #[cfg(test)]
@@ -1102,5 +1673,65 @@ mod tests {
         let response = handle_initialize(Some(json!(8)), Some(json!({})));
         assert_eq!(response.id, Some(json!(8)));
         assert_eq!(response.error.unwrap().code, ERR_INVALID_PARAMS);
+    }
+
+    #[test]
+    fn task_timestamp_uses_rfc3339_utc() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        let timestamp = now_rfc3339();
+        assert!(timestamp.ends_with('Z'));
+        assert_eq!(timestamp.len(), 24);
+    }
+
+    #[test]
+    fn initialize_advertises_task_support() {
+        let response = handle_initialize(Some(json!(9)), Some(initialize_params()));
+        let tasks = &response.result.unwrap()["capabilities"]["tasks"];
+        assert!(tasks["requests"]["tools"]["call"].is_object());
+        assert!(tasks["cancel"].is_object());
+    }
+
+    #[tokio::test]
+    async fn task_can_complete_and_return_tool_result() {
+        let (notification_tx, _notification_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(ServerState::new(notification_tx));
+        let task = start_tool_task(
+            state.clone(),
+            "browser_wait".to_string(),
+            serde_json::Map::from_iter([("timeout_ms".to_string(), json!(1))]),
+            TaskRequest::default(),
+            None,
+        )
+        .await;
+
+        let response = handle_task_result(
+            &state,
+            Some(json!(10)),
+            Some(json!({"taskId": task.task_id})),
+        )
+        .await;
+        assert_eq!(response.result.unwrap()["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn task_can_be_cancelled() {
+        let (notification_tx, _notification_rx) = mpsc::unbounded_channel();
+        let state = Arc::new(ServerState::new(notification_tx));
+        let task = start_tool_task(
+            state.clone(),
+            "browser_wait".to_string(),
+            serde_json::Map::from_iter([("timeout_ms".to_string(), json!(60_000))]),
+            TaskRequest::default(),
+            None,
+        )
+        .await;
+
+        let response = handle_task_cancel(
+            &state,
+            Some(json!(11)),
+            Some(json!({"taskId": task.task_id})),
+        )
+        .await;
+        assert_eq!(response.result.unwrap()["task"]["status"], "cancelled");
     }
 }

@@ -67,6 +67,18 @@ pub struct ActionResult {
     pub message: String,
 }
 
+/// Execution context details for actions dispatched inside an iframe.
+pub struct ContextActionOptions<'a> {
+    /// URL captured with the snapshot, used to detect navigation races.
+    pub snapshot_url: Option<&'a str>,
+    /// Snapshot identifier that owns the referenced element.
+    pub snapshot_id: Option<&'a str>,
+    /// Maximum time to wait for the element to become actionable.
+    pub timeout_ms: u64,
+    /// Frame content offset relative to the main viewport.
+    pub frame_offset: (f64, f64),
+}
+
 /// Dispatch an action.
 ///
 /// Executes the specified browser operation.
@@ -82,6 +94,8 @@ pub async fn dispatch_action(
     ref_id: &str,
     action: ActionKind,
     snapshot_url: Option<&str>,
+    snapshot_id: Option<&str>,
+    timeout_ms: u64,
 ) -> Result<ActionResult> {
     info!("Action {:?} on ref_id={}", action, ref_id);
 
@@ -98,8 +112,11 @@ pub async fn dispatch_action(
 
     // 无需元素的操作
     if let ActionKind::Drag { ref target_ref_id } = action {
-        inject_refs(page).await?;
-        return dispatch_drag(page, ref_id, target_ref_id).await;
+        let source_selector = element_selector(ref_id, snapshot_id);
+        let target_selector = element_selector(target_ref_id, snapshot_id);
+        wait_for_actionable(page, None, &source_selector, false, timeout_ms).await?;
+        wait_for_actionable(page, None, &target_selector, false, timeout_ms).await?;
+        return dispatch_drag(page, ref_id, target_ref_id, snapshot_id).await;
     }
     if let ActionKind::Scroll {
         ref direction,
@@ -118,11 +135,26 @@ pub async fn dispatch_action(
     }
 
     // 元素查找
-    let selector = format!("[data-agent-ref=\"{}\"]", ref_id);
+    let selector = element_selector(ref_id, snapshot_id);
 
     if page.find_element(&selector).await.is_err() {
         debug!("ref_id {} not found — injecting refs", ref_id);
         inject_refs(page).await?;
+    }
+
+    wait_for_actionable(
+        page,
+        None,
+        &selector,
+        matches!(&action, ActionKind::Type { .. }),
+        timeout_ms,
+    )
+    .await?;
+    if matches!(
+        &action,
+        ActionKind::Click | ActionKind::DoubleClick | ActionKind::RightClick | ActionKind::Hover
+    ) {
+        return dispatch_pointer_action(page, None, &selector, &action, (0.0, 0.0)).await;
     }
 
     match execute_action(page, &selector, action.clone()).await {
@@ -140,17 +172,140 @@ pub async fn dispatch_action(
     }
 }
 
+async fn type_in_context(
+    page: &Page,
+    context_id: i64,
+    selector: &str,
+    text: &str,
+    clear_first: bool,
+) -> Result<ActionResult> {
+    use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
+    use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
+
+    let selector_json = serde_json::to_string(selector)?;
+    let script = format!(
+        r#"(() => {{
+            const el = document.querySelector({selector_json});
+            if (!el) return false;
+            el.focus();
+            if ({clear_first}) {{
+                if (typeof el.select === 'function') el.select();
+                else {{
+                    const range = document.createRange();
+                    range.selectNodeContents(el);
+                    const selection = getSelection();
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                }}
+            }}
+            return true;
+        }})()"#
+    );
+    let params = EvaluateParams::builder()
+        .expression(script)
+        .context_id(ExecutionContextId::new(context_id))
+        .return_by_value(true)
+        .build()
+        .map_err(Error::InvalidParameter)?;
+    let focused: bool = page
+        .evaluate_expression(params)
+        .await
+        .map_err(|error| Error::JavaScript(error.to_string()))?
+        .into_value()
+        .map_err(|error| Error::JavaScript(error.to_string()))?;
+    if !focused {
+        return Err(Error::ElementNotFound(selector.to_string()));
+    }
+    page.execute(InsertTextParams::new(text))
+        .await
+        .map_err(|error| Error::Cdp(error.to_string()))?;
+    Ok(ActionResult {
+        success: true,
+        message: format!("Typed {} characters", text.chars().count()),
+    })
+}
+
+async fn press_in_context(
+    page: &Page,
+    context_id: i64,
+    selector: &str,
+    key: &str,
+) -> Result<ActionResult> {
+    use chromiumoxide::cdp::browser_protocol::input::{
+        DispatchKeyEventParams, DispatchKeyEventType,
+    };
+    use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
+
+    let selector_json = serde_json::to_string(selector)?;
+    let params = EvaluateParams::builder()
+        .expression(format!(
+            "(() => {{ const el=document.querySelector({selector_json}); if (!el) return false; el.focus(); return true; }})()"
+        ))
+        .context_id(ExecutionContextId::new(context_id))
+        .return_by_value(true)
+        .build()
+        .map_err(Error::InvalidParameter)?;
+    let focused: bool = page
+        .evaluate_expression(params)
+        .await
+        .map_err(|error| Error::JavaScript(error.to_string()))?
+        .into_value()
+        .map_err(|error| Error::JavaScript(error.to_string()))?;
+    if !focused {
+        return Err(Error::ElementNotFound(selector.to_string()));
+    }
+
+    let definition = chromiumoxide::keys::get_key_definition(key)
+        .ok_or_else(|| Error::InvalidParameter(format!("Unknown key: {key}")))?;
+    let mut command = DispatchKeyEventParams::builder();
+    let key_down_type = if let Some(text) = definition.text {
+        command = command.text(text);
+        DispatchKeyEventType::KeyDown
+    } else if definition.key.len() == 1 {
+        command = command.text(definition.key);
+        DispatchKeyEventType::KeyDown
+    } else {
+        DispatchKeyEventType::RawKeyDown
+    };
+    command = command
+        .key(definition.key)
+        .code(definition.code)
+        .windows_virtual_key_code(definition.key_code)
+        .native_virtual_key_code(definition.key_code);
+    page.execute(
+        command
+            .clone()
+            .r#type(key_down_type)
+            .build()
+            .map_err(Error::InvalidParameter)?,
+    )
+    .await
+    .map_err(|error| Error::Cdp(error.to_string()))?;
+    page.execute(
+        command
+            .r#type(DispatchKeyEventType::KeyUp)
+            .build()
+            .map_err(Error::InvalidParameter)?,
+    )
+    .await
+    .map_err(|error| Error::Cdp(error.to_string()))?;
+    Ok(ActionResult {
+        success: true,
+        message: format!("Pressed {key}"),
+    })
+}
+
 /// Dispatch an action inside a specific CDP execution context.
 pub async fn dispatch_action_in_context(
     page: &Page,
     context_id: i64,
     ref_id: &str,
     action: ActionKind,
-    snapshot_url: Option<&str>,
+    options: ContextActionOptions<'_>,
 ) -> Result<ActionResult> {
     use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
 
-    if let Some(expected_url) = snapshot_url {
+    if let Some(expected_url) = options.snapshot_url {
         let current = page.url().await.ok().flatten().unwrap_or_default();
         if current != expected_url {
             return Err(Error::PageChanged {
@@ -169,7 +324,56 @@ pub async fn dispatch_action_in_context(
         });
     }
 
-    let selector = format!("[data-agent-ref=\"{ref_id}\"]");
+    let selector = element_selector(ref_id, options.snapshot_id);
+    if let ActionKind::Drag { target_ref_id } = &action {
+        let target = element_selector(target_ref_id, options.snapshot_id);
+        wait_for_actionable(page, Some(context_id), &target, false, options.timeout_ms).await?;
+    }
+    wait_for_actionable(
+        page,
+        Some(context_id),
+        &selector,
+        matches!(&action, ActionKind::Type { .. }),
+        options.timeout_ms,
+    )
+    .await?;
+    if let ActionKind::Drag { target_ref_id } = &action {
+        let target = element_selector(target_ref_id, options.snapshot_id);
+        return dispatch_drag_pointer(
+            page,
+            Some(context_id),
+            &selector,
+            &target,
+            options.frame_offset,
+        )
+        .await;
+    }
+    if let ActionKind::Type { text, clear_first } = &action {
+        return type_in_context(
+            page,
+            context_id,
+            &selector,
+            text,
+            clear_first.unwrap_or(false),
+        )
+        .await;
+    }
+    if let ActionKind::Press { key } = &action {
+        return press_in_context(page, context_id, &selector, key).await;
+    }
+    if matches!(
+        &action,
+        ActionKind::Click | ActionKind::DoubleClick | ActionKind::RightClick | ActionKind::Hover
+    ) {
+        return dispatch_pointer_action(
+            page,
+            Some(context_id),
+            &selector,
+            &action,
+            options.frame_offset,
+        )
+        .await;
+    }
     let selector_json = serde_json::to_string(&selector)?;
     let script = match action {
         ActionKind::Click => format!(
@@ -224,7 +428,7 @@ pub async fn dispatch_action_in_context(
             )
         }
         ActionKind::Drag { target_ref_id } => {
-            let target = format!("[data-agent-ref=\"{target_ref_id}\"]");
+            let target = element_selector(&target_ref_id, options.snapshot_id);
             let target_json = serde_json::to_string(&target)?;
             format!(
                 "(() => {{ const src = document.querySelector({selector_json}); const target = document.querySelector({target_json}); if (!src || !target) return {{ok:false,error:'Drag source or target not found'}}; const data = new DataTransfer(); src.dispatchEvent(new DragEvent('dragstart', {{bubbles:true,dataTransfer:data}})); target.dispatchEvent(new DragEvent('dragover', {{bubbles:true,dataTransfer:data}})); target.dispatchEvent(new DragEvent('drop', {{bubbles:true,dataTransfer:data}})); src.dispatchEvent(new DragEvent('dragend', {{bubbles:true,dataTransfer:data}})); return {{ok:true,message:'Dragged'}}; }})()"
@@ -264,6 +468,190 @@ pub async fn dispatch_action_in_context(
                 .unwrap_or("Element action failed")
                 .to_string(),
         ))
+    }
+}
+
+/// Dispatch a trusted CDP pointer action after resolving the target in a frame context.
+pub async fn dispatch_pointer_action(
+    page: &Page,
+    context_id: Option<i64>,
+    selector: &str,
+    action: &ActionKind,
+    frame_offset: (f64, f64),
+) -> Result<ActionResult> {
+    use chromiumoxide::cdp::browser_protocol::input::{
+        DispatchMouseEventParams, DispatchMouseEventType, MouseButton,
+    };
+    use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
+
+    let selector_json = serde_json::to_string(selector)?;
+    let script = format!(
+        "(() => {{ const el = document.querySelector({selector_json}); if (!el) return null; el.scrollIntoView({{block:'center',inline:'center'}}); const r=el.getBoundingClientRect(); return {{x:r.left+r.width/2,y:r.top+r.height/2}}; }})()"
+    );
+    let point: serde_json::Value = if let Some(context_id) = context_id {
+        let params = EvaluateParams::builder()
+            .expression(script)
+            .context_id(ExecutionContextId::new(context_id))
+            .return_by_value(true)
+            .build()
+            .map_err(Error::InvalidParameter)?;
+        page.evaluate_expression(params)
+            .await
+            .map_err(|error| Error::JavaScript(error.to_string()))?
+            .into_value()
+            .map_err(|error| Error::JavaScript(error.to_string()))?
+    } else {
+        page.evaluate(script)
+            .await
+            .map_err(|error| Error::JavaScript(error.to_string()))?
+            .into_value()
+            .map_err(|error| Error::JavaScript(error.to_string()))?
+    };
+    if point.is_null() {
+        return Err(Error::ElementNotFound(selector.to_string()));
+    }
+    let x = point["x"].as_f64().unwrap_or_default() + frame_offset.0;
+    let y = point["y"].as_f64().unwrap_or_default() + frame_offset.1;
+
+    page.execute(DispatchMouseEventParams::new(
+        DispatchMouseEventType::MouseMoved,
+        x,
+        y,
+    ))
+    .await
+    .map_err(|error| Error::Cdp(error.to_string()))?;
+    if matches!(action, ActionKind::Hover) {
+        return Ok(ActionResult {
+            success: true,
+            message: format!("Hovered at ({x:.1}, {y:.1})"),
+        });
+    }
+
+    let (button, buttons, click_count, message) = match action {
+        ActionKind::RightClick => (MouseButton::Right, 2, 1, "Right-clicked"),
+        ActionKind::DoubleClick => (MouseButton::Left, 1, 2, "Double-clicked"),
+        _ => (MouseButton::Left, 1, 1, "Clicked"),
+    };
+    let mut pressed = DispatchMouseEventParams::new(DispatchMouseEventType::MousePressed, x, y);
+    pressed.button = Some(button.clone());
+    pressed.buttons = Some(buttons);
+    pressed.click_count = Some(click_count);
+    page.execute(pressed)
+        .await
+        .map_err(|error| Error::Cdp(error.to_string()))?;
+    let mut released = DispatchMouseEventParams::new(DispatchMouseEventType::MouseReleased, x, y);
+    released.button = Some(button);
+    released.buttons = Some(0);
+    released.click_count = Some(click_count);
+    page.execute(released)
+        .await
+        .map_err(|error| Error::Cdp(error.to_string()))?;
+
+    Ok(ActionResult {
+        success: true,
+        message: message.to_string(),
+    })
+}
+
+/// Wait until an element can be interacted with reliably.
+pub async fn wait_for_actionable(
+    page: &Page,
+    context_id: Option<i64>,
+    selector: &str,
+    require_editable: bool,
+    timeout_ms: u64,
+) -> Result<()> {
+    use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
+
+    let selector_json = serde_json::to_string(selector)?;
+    let script = format!(
+        r#"(async () => {{
+            const selector = {selector_json};
+            const requireEditable = {require_editable};
+            const deadline = performance.now() + {timeout_ms};
+            let lastReason = 'element not found';
+            while (performance.now() <= deadline) {{
+                const el = document.querySelector(selector);
+                if (!el) {{ lastReason = 'element not found'; await new Promise(r => setTimeout(r, 50)); continue; }}
+                const style = getComputedStyle(el);
+                const rect1 = el.getBoundingClientRect();
+                const visible = style.visibility !== 'hidden' && style.display !== 'none' &&
+                    style.opacity !== '0' && style.pointerEvents !== 'none' && rect1.width > 0 && rect1.height > 0;
+                if (!visible) {{ lastReason = 'element is not visible'; await new Promise(r => setTimeout(r, 50)); continue; }}
+                const inViewport = rect1.bottom > 0 && rect1.right > 0 && rect1.top < innerHeight && rect1.left < innerWidth;
+                if (!inViewport) {{
+                    lastReason = 'element is outside the viewport';
+                    el.scrollIntoView({{block:'center', inline:'center', behavior:'instant'}});
+                    await new Promise(requestAnimationFrame);
+                    await new Promise(requestAnimationFrame);
+                    continue;
+                }}
+                await new Promise(requestAnimationFrame);
+                await new Promise(requestAnimationFrame);
+                const rect2 = el.getBoundingClientRect();
+                const stable = Math.abs(rect1.x - rect2.x) < 0.5 && Math.abs(rect1.y - rect2.y) < 0.5 &&
+                    Math.abs(rect1.width - rect2.width) < 0.5 && Math.abs(rect1.height - rect2.height) < 0.5;
+                if (!stable) {{ lastReason = 'element is moving or animating'; continue; }}
+                const disabled = el.disabled === true || el.matches?.(':disabled') || el.getAttribute('aria-disabled') === 'true';
+                if (disabled) {{ lastReason = 'element is disabled'; await new Promise(r => setTimeout(r, 50)); continue; }}
+                if (requireEditable) {{
+                    const editable = el.isContentEditable ||
+                        ((el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) && !el.readOnly);
+                    if (!editable) {{ lastReason = 'element is not editable'; await new Promise(r => setTimeout(r, 50)); continue; }}
+                }}
+                const x = Math.max(0, Math.min(innerWidth - 1, rect2.left + rect2.width / 2));
+                const y = Math.max(0, Math.min(innerHeight - 1, rect2.top + rect2.height / 2));
+                const hit = document.elementFromPoint(x, y);
+                if (!hit || (hit !== el && !el.contains(hit))) {{
+                    lastReason = 'element does not receive pointer events';
+                    await new Promise(r => setTimeout(r, 50));
+                    continue;
+                }}
+                return {{ok:true}};
+            }}
+            return {{ok:false, reason:lastReason}};
+        }})()"#
+    );
+
+    let value: serde_json::Value = if let Some(context_id) = context_id {
+        let params = EvaluateParams::builder()
+            .expression(script)
+            .context_id(ExecutionContextId::new(context_id))
+            .await_promise(true)
+            .return_by_value(true)
+            .build()
+            .map_err(Error::InvalidParameter)?;
+        page.evaluate_expression(params)
+            .await
+            .map_err(|error| Error::JavaScript(error.to_string()))?
+            .into_value()
+            .map_err(|error| Error::JavaScript(error.to_string()))?
+    } else {
+        page.evaluate(script)
+            .await
+            .map_err(|error| Error::JavaScript(error.to_string()))?
+            .into_value()
+            .map_err(|error| Error::JavaScript(error.to_string()))?
+    };
+
+    if value["ok"].as_bool().unwrap_or(false) {
+        Ok(())
+    } else {
+        Err(Error::ElementNotActionable(
+            value["reason"]
+                .as_str()
+                .unwrap_or("actionability check timed out")
+                .to_string(),
+        ))
+    }
+}
+
+fn element_selector(ref_id: &str, snapshot_id: Option<&str>) -> String {
+    match snapshot_id {
+        Some(snapshot_id) => {
+            format!("[data-agent-ref={ref_id:?}][data-agent-snapshot={snapshot_id:?}]")
+        }
+        None => format!("[data-agent-ref={ref_id:?}]"),
     }
 }
 
@@ -351,25 +739,44 @@ async fn execute_action(page: &Page, selector: &str, action: ActionKind) -> Resu
         }
 
         ActionKind::Type { text, clear_first } => {
-            let elem = find_elem()
-                .await
-                .map_err(|_| Error::ElementNotFound(selector.to_string()))?;
+            use chromiumoxide::cdp::browser_protocol::input::InsertTextParams;
 
-            if clear_first.unwrap_or(false) {
-                elem.click().await.map_err(|e| Error::Cdp(e.to_string()))?;
-                elem.press_key("Control+a")
-                    .await
-                    .map_err(|e| Error::Cdp(e.to_string()))?;
-                elem.press_key("Backspace")
-                    .await
-                    .map_err(|e| Error::Cdp(e.to_string()))?;
+            let clear_first = clear_first.unwrap_or(false);
+            let script = format!(
+                r#"(() => {{
+                    const el = document.querySelector({selector:?});
+                    if (!el) return false;
+                    el.focus();
+                    if ({clear_first}) {{
+                        if (typeof el.select === 'function') el.select();
+                        else {{
+                            const range = document.createRange();
+                            range.selectNodeContents(el);
+                            const selection = getSelection();
+                            selection.removeAllRanges();
+                            selection.addRange(range);
+                        }}
+                    }} else if (typeof el.setSelectionRange === 'function') {{
+                        const end = String(el.value || '').length;
+                        el.setSelectionRange(end, end);
+                    }}
+                    return true;
+                }})()"#
+            );
+            let focused: bool = page
+                .evaluate(script)
+                .await
+                .map_err(|error| Error::JavaScript(error.to_string()))?
+                .into_value()
+                .map_err(|error| Error::JavaScript(error.to_string()))?;
+            if !focused {
+                return Err(Error::ElementNotFound(selector.to_string()));
             }
-
-            elem.type_str(&text)
+            page.execute(InsertTextParams::new(&text))
                 .await
-                .map_err(|e| Error::Cdp(e.to_string()))?;
+                .map_err(|error| Error::Cdp(error.to_string()))?;
 
-            Ok(format!("Typed: {}", text))
+            Ok(format!("Typed {} characters", text.chars().count()))
         }
 
         ActionKind::Press { key } => {
@@ -474,45 +881,167 @@ async fn dispatch_drag(
     page: &Page,
     source_ref_id: &str,
     target_ref_id: &str,
+    snapshot_id: Option<&str>,
 ) -> Result<ActionResult> {
-    let src_attr = format!("[data-agent-ref={:?}]", source_ref_id);
-    let tgt_attr = format!("[data-agent-ref={:?}]", target_ref_id);
-    let js = format!(
-        r#"
-        (() => {{
-            const src = document.querySelector({src_sel:?});
-            const tgt = document.querySelector({tgt_sel:?});
-            if (!src) return {{ok:false,error:'source not found'}};
-            if (!tgt) return {{ok:false,error:'target not found'}};
-            const dt = new DataTransfer();
-            src.dispatchEvent(new DragEvent('dragstart',  {{bubbles:true,cancelable:true,dataTransfer:dt}}));
-            tgt.dispatchEvent(new DragEvent('dragenter',  {{bubbles:true,cancelable:true,dataTransfer:dt}}));
-            tgt.dispatchEvent(new DragEvent('dragover',   {{bubbles:true,cancelable:true,dataTransfer:dt}}));
-            tgt.dispatchEvent(new DragEvent('drop',       {{bubbles:true,cancelable:true,dataTransfer:dt}}));
-            src.dispatchEvent(new DragEvent('dragend',    {{bubbles:true,cancelable:true,dataTransfer:dt}}));
-            return {{ok:true}};
-        }})()
-        "#,
-        src_sel = src_attr,
-        tgt_sel = tgt_attr
+    let src_attr = element_selector(source_ref_id, snapshot_id);
+    let tgt_attr = element_selector(target_ref_id, snapshot_id);
+    dispatch_drag_pointer(page, None, &src_attr, &tgt_attr, (0.0, 0.0)).await
+}
+
+async fn dispatch_drag_pointer(
+    page: &Page,
+    context_id: Option<i64>,
+    source_selector: &str,
+    target_selector: &str,
+    frame_offset: (f64, f64),
+) -> Result<ActionResult> {
+    use chromiumoxide::cdp::browser_protocol::input::{
+        DispatchDragEventParams, DispatchDragEventType, DispatchMouseEventParams,
+        DispatchMouseEventType, DragDataItem, EventDragIntercepted, MouseButton,
+        SetInterceptDragsParams,
+    };
+    use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
+    use futures::StreamExt;
+
+    let source_json = serde_json::to_string(source_selector)?;
+    let target_json = serde_json::to_string(target_selector)?;
+    let expression = format!(
+        r#"(() => {{
+            const source = document.querySelector({source_json});
+            const target = document.querySelector({target_json});
+            if (!source || !target) return null;
+            const sourceRect = source.getBoundingClientRect();
+            const targetRect = target.getBoundingClientRect();
+            return {{
+                source: {{x: sourceRect.left + sourceRect.width / 2, y: sourceRect.top + sourceRect.height / 2}},
+                target: {{x: targetRect.left + targetRect.width / 2, y: targetRect.top + targetRect.height / 2}}
+            }};
+        }})()"#
     );
-
-    let result: serde_json::Value = page
-        .evaluate(js)
-        .await
-        .map_err(|e| Error::JavaScript(e.to_string()))?
-        .into_value()
-        .map_err(|e| Error::JavaScript(e.to_string()))?;
-
-    if result["ok"].as_bool().unwrap_or(false) {
-        Ok(ActionResult {
-            success: true,
-            message: format!("Dragged {} → {}", source_ref_id, target_ref_id),
-        })
+    let value: serde_json::Value = if let Some(context_id) = context_id {
+        let params = EvaluateParams::builder()
+            .expression(expression)
+            .context_id(ExecutionContextId::new(context_id))
+            .return_by_value(true)
+            .build()
+            .map_err(Error::InvalidParameter)?;
+        page.evaluate_expression(params)
+            .await
+            .map_err(|error| Error::JavaScript(error.to_string()))?
+            .into_value()
+            .map_err(|error| Error::JavaScript(error.to_string()))?
     } else {
-        let err = result["error"].as_str().unwrap_or("unknown").to_string();
-        Err(Error::ElementNotFound(format!("Drag failed: {err}")))
+        page.evaluate(expression)
+            .await
+            .map_err(|error| Error::JavaScript(error.to_string()))?
+            .into_value()
+            .map_err(|error| Error::JavaScript(error.to_string()))?
+    };
+    if value.is_null() {
+        return Err(Error::ElementNotFound(
+            "Drag source or target not found".to_string(),
+        ));
     }
+
+    let source_x = value["source"]["x"].as_f64().unwrap_or_default() + frame_offset.0;
+    let source_y = value["source"]["y"].as_f64().unwrap_or_default() + frame_offset.1;
+    let target_x = value["target"]["x"].as_f64().unwrap_or_default() + frame_offset.0;
+    let target_y = value["target"]["y"].as_f64().unwrap_or_default() + frame_offset.1;
+
+    let mut drag_events = page
+        .event_listener::<EventDragIntercepted>()
+        .await
+        .map_err(|error| Error::Cdp(error.to_string()))?;
+    page.execute(SetInterceptDragsParams::new(true))
+        .await
+        .map_err(|error| Error::Cdp(error.to_string()))?;
+
+    let drag_result = async {
+        page.execute(DispatchMouseEventParams::new(
+            DispatchMouseEventType::MouseMoved,
+            source_x,
+            source_y,
+        ))
+        .await
+        .map_err(|error| Error::Cdp(error.to_string()))?;
+        let mut pressed =
+            DispatchMouseEventParams::new(DispatchMouseEventType::MousePressed, source_x, source_y);
+        pressed.button = Some(MouseButton::Left);
+        pressed.buttons = Some(1);
+        pressed.click_count = Some(1);
+        page.execute(pressed)
+            .await
+            .map_err(|error| Error::Cdp(error.to_string()))?;
+
+        for step in 1..=10 {
+            let progress = f64::from(step) / 10.0;
+            let mut moved = DispatchMouseEventParams::new(
+                DispatchMouseEventType::MouseMoved,
+                source_x + (target_x - source_x) * progress,
+                source_y + (target_y - source_y) * progress,
+            );
+            moved.button = Some(MouseButton::Left);
+            moved.buttons = Some(1);
+            page.execute(moved)
+                .await
+                .map_err(|error| Error::Cdp(format!("drag move failed: {error}")))?;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        if let Ok(Some(intercepted)) =
+            tokio::time::timeout(Duration::from_secs(2), drag_events.next()).await
+        {
+            for event_type in [
+                DispatchDragEventType::DragEnter,
+                DispatchDragEventType::DragOver,
+                DispatchDragEventType::Drop,
+            ] {
+                let event_label = format!("{event_type:?}");
+                let mut drag_data = intercepted.data.clone();
+                if drag_data.drag_operations_mask < 0 {
+                    // Chrome reports -1 for "all operations", while
+                    // Input.dispatchDragEvent accepts only a non-negative mask.
+                    drag_data.drag_operations_mask = 17; // Copy | Move
+                }
+                if drag_data.items.is_empty() {
+                    // chromiumoxide omits an empty items array, but Chrome
+                    // requires Input.DragData.items to be present.
+                    drag_data.items.push(DragDataItem::new("text/plain", ""));
+                }
+                page.execute(DispatchDragEventParams::new(
+                    event_type, target_x, target_y, drag_data,
+                ))
+                .await
+                .map_err(|error| Error::Cdp(format!("drag event {event_label} failed: {error}")))?;
+            }
+        }
+
+        let mut released = DispatchMouseEventParams::new(
+            DispatchMouseEventType::MouseReleased,
+            target_x,
+            target_y,
+        );
+        released.button = Some(MouseButton::Left);
+        released.buttons = Some(0);
+        released.click_count = Some(1);
+        page.execute(released)
+            .await
+            .map_err(|error| Error::Cdp(error.to_string()))?;
+        Ok::<(), Error>(())
+    }
+    .await;
+
+    let disable_result = page
+        .execute(SetInterceptDragsParams::new(false))
+        .await
+        .map_err(|error| Error::Cdp(error.to_string()));
+    drag_result?;
+    disable_result?;
+
+    Ok(ActionResult {
+        success: true,
+        message: "Dragged element".to_string(),
+    })
 }
 
 // ============================================================================

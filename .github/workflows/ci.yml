@@ -31,6 +31,18 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  browser-e2e:
+    name: Browser E2E
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify Chrome
+        run: google-chrome --version
+      - name: Run browser workflow
+        run: cargo test -p agent-browser-core --test browser_e2e -- --ignored --nocapture
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
@@ -62,7 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: dtolnay/rust-toolchain@1.88.0
       - uses: Swatinem/rust-cache@v2
       - name: Check with MSRV
         run: cargo check --workspace

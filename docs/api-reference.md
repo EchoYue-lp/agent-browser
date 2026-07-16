@@ -18,10 +18,13 @@ Agent Browser implements [MCP 2025-11-25](https://modelcontextprotocol.io/specif
 | **Resources** | Screenshot and snapshot as resources |
 | **Prompts** | Pre-defined prompts for common tasks |
 | **Logging** | Configurable log levels |
+| **Tasks** | Durable tool execution with get/list/result/cancel methods |
 
 ## MCP Tools
 
 Agent Browser provides 30+ MCP tools for AI agents.
+
+Ref-based tools (`browser_click`, `browser_type`, `browser_press`, `browser_scroll`, uploads, iframe entry, and click-download) require both the `snapshot_id` and `ref_id` returned by `browser_snapshot`. A new observation invalidates earlier references.
 
 ### Tool Annotations
 
@@ -103,6 +106,12 @@ Access browser state as MCP resources:
 |--------------|-------------|-----------|
 | `resource://browser/screenshot` | Current page screenshot | `image/png` |
 | `resource://browser/snapshot` | Accessibility tree snapshot | `text/plain` |
+
+## MCP Tasks, Progress, and Cancellation
+
+Task-capable tools advertise `execution.taskSupport: "optional"`. Pass `task: {"ttl": 600000}` to `tools/call`, then use `tasks/get`, `tasks/list`, `tasks/result`, or `tasks/cancel`. Requests with `_meta.progressToken` receive `notifications/progress`; `notifications/cancelled` aborts the matching in-flight JSON-RPC request.
+
+Set `BROWSER_MCP_CAPS` to a comma-separated subset of `network`, `storage`, `files`, and `devtools`. Disabled tools are neither listed nor callable.
 
 ### Reading Resources
 
@@ -189,6 +198,10 @@ Optional API key authentication via `X-API-Key` or Bearer authorization:
 curl -H "X-API-Key: YOUR_API_KEY" http://localhost:3000/snapshot
 ```
 
+### Isolated Sessions
+
+Create a session with `POST /sessions`, then send its ID in `X-Browser-Session` on browser requests. Use `GET /sessions` to list sessions and `DELETE /sessions/{id}` to shut one down. Omitting the header uses the default session.
+
 ### Endpoints
 
 #### Navigation
@@ -251,7 +264,7 @@ Perform an action on an element.
 ```bash
 curl -X POST http://localhost:3000/act \
   -H "Content-Type: application/json" \
-  -d '{"ref_id": "ax1", "action": "click"}'
+  -d '{"snapshot_id": "SNAPSHOT_ID", "ref_id": "ax1", "action": "click"}'
 ```
 
 **Actions:**
@@ -606,7 +619,7 @@ ws.onmessage = (event) => {
 The main entry point for browser automation.
 
 ```rust
-use agent_browser_core::{BrowserEngine, BrowserConfig, HeadlessMode};
+use agent_browser_core::{ActionKind, BrowserEngine, BrowserConfig, HeadlessMode};
 
 // Create engine
 let engine = BrowserEngine::new(BrowserConfig::default());
@@ -620,8 +633,10 @@ engine.navigate("https://example.com").await?;
 // Get snapshot
 let snapshot = engine.snapshot().await?;
 
-// Click by ref_id
-engine.click("ax1").await?;
+// Click only with the snapshot that produced the ref_id
+engine
+    .act_with_snapshot(&snapshot.snapshot_id, "ax1", ActionKind::Click)
+    .await?;
 
 // Click by CSS selector
 engine.click_selector("button.primary", None).await?;
