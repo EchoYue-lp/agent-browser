@@ -126,7 +126,7 @@ pub use error::{Error, Result};
 pub use snapshot::{PageSnapshot, SnapshotNode};
 pub use types::{
     Bounds, BrowserConfig, ConsoleMessage, CookieInfo, DownloadOptions, DownloadResult,
-    DownloadStatus, HeadlessMode, KeyModifier, NavigateResult, NavigationWaitUntil,
-    NetworkRequest, NetworkResponse, PageInfo, PressOptions, ScreenshotOptions, ScreenshotResult,
-    SetCookieParam, TabInfo, ToolResult, ViewportSize, WaitOptions,
+    DownloadStatus, HeadlessMode, KeyModifier, NavigateResult, NavigationWaitUntil, NetworkRequest,
+    NetworkResponse, PageInfo, PressOptions, ScreenshotOptions, ScreenshotResult, SetCookieParam,
+    TabInfo, ToolResult, ViewportSize, WaitOptions,
 };

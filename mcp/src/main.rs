@@ -38,7 +38,7 @@ use std::sync::Arc;
 use agent_browser_core::snapshot::format_snapshot;
 use agent_browser_core::{BrowserConfig, BrowserEngine, ScreenshotOptions, SetCookieParam};
 use serde_json::{Value, json};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 mod protocol;
 mod tools;
@@ -70,7 +70,8 @@ impl ServerState {
     }
 
     fn set_initialized(&self) {
-        self.initialized.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.initialized
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -111,28 +112,28 @@ fn parse_args() -> (TransportType, u16) {
     while i < args.len() {
         match args[i].as_str() {
             "--transport" | "-t" => {
-                if i + 1 < args.len() {
-                    match args[i + 1].parse() {
-                        Ok(t) => transport = t,
-                        Err(e) => {
-                            eprintln!("Error: {}", e);
-                            std::process::exit(1);
-                        }
-                    }
-                    i += 1;
-                }
+                let value = args.get(i + 1).unwrap_or_else(|| {
+                    eprintln!("Error: --transport requires a value");
+                    std::process::exit(1);
+                });
+                transport = value.parse().unwrap_or_else(|error| {
+                    eprintln!("Error: {error}");
+                    std::process::exit(1);
+                });
+                i += 2;
+                continue;
             }
             "--port" | "-p" => {
-                if i + 1 < args.len() {
-                    match args[i + 1].parse() {
-                        Ok(p) => port = p,
-                        Err(_) => {
-                            eprintln!("Error: Invalid port number");
-                            std::process::exit(1);
-                        }
-                    }
-                    i += 1;
-                }
+                let value = args.get(i + 1).unwrap_or_else(|| {
+                    eprintln!("Error: --port requires a value");
+                    std::process::exit(1);
+                });
+                port = value.parse().unwrap_or_else(|_| {
+                    eprintln!("Error: Invalid port number");
+                    std::process::exit(1);
+                });
+                i += 2;
+                continue;
             }
             "--help" | "-h" => {
                 println!("agent-browser-mcp [OPTIONS]");
@@ -161,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let (transport, port) = parse_args();
+    let (transport, _port) = parse_args();
 
     match transport {
         TransportType::Stdio => run_stdio_server().await,
@@ -191,21 +192,33 @@ async fn run_stdio_server() -> anyhow::Result<()> {
     let state = Arc::new(ServerState::new());
     let transport = transport::stdio::StdioTransport::new();
 
-    transport.run(|request| {
-        let state = state.clone();
-        async move {
-            handle_request(&state, request).await
-        }
-    }).await
+    let notification_state = state.clone();
+    transport
+        .run(
+            |request| {
+                let state = state.clone();
+                async move { handle_request(&state, request).await }
+            },
+            move |notification| handle_notification(&notification_state, &notification),
+        )
+        .await
 }
 
 /// 处理 MCP 请求
 async fn handle_request(state: &ServerState, request: JsonRpcRequest) -> JsonRpcResponse {
     let id = request.id.clone();
 
+    if !matches!(request.method.as_str(), "initialize" | "ping") && !state.is_initialized() {
+        return JsonRpcResponse::error_response(
+            id,
+            ERR_INVALID_REQUEST,
+            "Server has not received notifications/initialized",
+        );
+    }
+
     match request.method.as_str() {
         // ── 生命周期 ────────────────────────────────────────────────────────
-        "initialize" => handle_initialize(state, request.params),
+        "initialize" => handle_initialize(id, request.params),
 
         "ping" => JsonRpcResponse::success(id, json!({})),
 
@@ -260,26 +273,23 @@ fn handle_notification(state: &ServerState, notification: &JsonRpcNotification) 
 // ---------------------------------------------------------------------------
 
 /// 处理 initialize 请求
-fn handle_initialize(state: &ServerState, params: Option<Value>) -> JsonRpcResponse {
-    let negotiated_version = if let Some(params) = params {
-        match serde_json::from_value::<InitializeParams>(params) {
-            Ok(init) => {
-                info!(
-                    "Client '{}' v{} requested protocol version {}",
-                    init.client_info.name,
-                    init.client_info.version,
-                    init.protocol_version
-                );
-                negotiate_version(&init.protocol_version)
-            }
-            Err(e) => {
-                warn!("Failed to parse initialize params: {}", e);
-                MCP_PROTOCOL_VERSION.to_string()
-            }
+fn handle_initialize(id: Option<Value>, params: Option<Value>) -> JsonRpcResponse {
+    let init = match params.and_then(|value| serde_json::from_value::<InitializeParams>(value).ok())
+    {
+        Some(init) => init,
+        None => {
+            return JsonRpcResponse::error_response(
+                id,
+                ERR_INVALID_PARAMS,
+                "Missing or invalid initialize params",
+            );
         }
-    } else {
-        MCP_PROTOCOL_VERSION.to_string()
     };
+    info!(
+        "Client '{}' v{} requested protocol version {}",
+        init.client_info.name, init.client_info.version, init.protocol_version
+    );
+    let negotiated_version = negotiate_version(&init.protocol_version);
 
     let result = InitializeResult {
         protocol_version: negotiated_version,
@@ -308,9 +318,9 @@ fn handle_initialize(state: &ServerState, params: Option<Value>) -> JsonRpcRespo
     };
 
     match serde_json::to_value(result) {
-        Ok(value) => JsonRpcResponse::success(None, value),
+        Ok(value) => JsonRpcResponse::success(id.clone(), value),
         Err(e) => JsonRpcResponse::error_response(
-            None,
+            id,
             ERR_INTERNAL,
             &format!("Failed to serialize initialize result: {}", e),
         ),
@@ -326,7 +336,11 @@ fn handle_tools_list(id: Option<Value>) -> JsonRpcResponse {
     };
     match serde_json::to_value(result) {
         Ok(value) => JsonRpcResponse::success(id, value),
-        Err(e) => JsonRpcResponse::error_response(id, ERR_INTERNAL, &format!("Serialization error: {}", e)),
+        Err(e) => JsonRpcResponse::error_response(
+            id,
+            ERR_INTERNAL,
+            &format!("Serialization error: {}", e),
+        ),
     }
 }
 
@@ -352,8 +366,23 @@ async fn handle_tools_call(
         }
     };
 
-    let arguments = params.arguments.unwrap_or(Value::Object(Default::default()));
-    let arguments_map = arguments.as_object().cloned().unwrap_or_default();
+    let arguments = params
+        .arguments
+        .unwrap_or(Value::Object(Default::default()));
+    let arguments_map = match arguments.as_object() {
+        Some(arguments) => arguments.clone(),
+        None => {
+            return JsonRpcResponse::error_response(
+                id,
+                ERR_INVALID_PARAMS,
+                "Tool arguments must be a JSON object",
+            );
+        }
+    };
+
+    if params.name == "browser_screenshot" {
+        return handle_screenshot_tool(state, id, &arguments_map).await;
+    }
 
     match execute_tool(state, &params.name, arguments_map).await {
         Ok(result) => {
@@ -364,7 +393,11 @@ async fn handle_tools_call(
             };
             match serde_json::to_value(tool_result) {
                 Ok(value) => JsonRpcResponse::success(id, value),
-                Err(e) => JsonRpcResponse::error_response(id, ERR_INTERNAL, &format!("Serialization error: {}", e)),
+                Err(e) => JsonRpcResponse::error_response(
+                    id,
+                    ERR_INTERNAL,
+                    &format!("Serialization error: {}", e),
+                ),
             }
         }
         Err(e) => {
@@ -375,9 +408,67 @@ async fn handle_tools_call(
             };
             match serde_json::to_value(tool_result) {
                 Ok(value) => JsonRpcResponse::success(id, value),
-                Err(e) => JsonRpcResponse::error_response(id, ERR_INTERNAL, &format!("Serialization error: {}", e)),
+                Err(e) => JsonRpcResponse::error_response(
+                    id,
+                    ERR_INTERNAL,
+                    &format!("Serialization error: {}", e),
+                ),
             }
         }
+    }
+}
+
+async fn handle_screenshot_tool(
+    state: &ServerState,
+    id: Option<Value>,
+    arguments: &serde_json::Map<String, Value>,
+) -> JsonRpcResponse {
+    let full_page = arguments.get("full_page").and_then(Value::as_bool);
+    let selector = arguments
+        .get("selector")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    let screenshot = state
+        .browser
+        .screenshot_with_options(ScreenshotOptions {
+            full_page,
+            selector,
+        })
+        .await;
+
+    let result = match screenshot {
+        Ok(screenshot) => ToolCallResult {
+            content: vec![
+                Content::Image {
+                    data: screenshot.data,
+                    mime_type: "image/png".to_string(),
+                },
+                Content::text(format!(
+                    "Screenshot captured: {}x{} PNG",
+                    screenshot.width, screenshot.height
+                )),
+            ],
+            is_error: false,
+            structured_content: Some(json!({
+                "width": screenshot.width,
+                "height": screenshot.height,
+                "format": screenshot.format,
+            })),
+        },
+        Err(error) => ToolCallResult {
+            content: vec![Content::text(format!("Error: {error}"))],
+            is_error: true,
+            structured_content: None,
+        },
+    };
+
+    match serde_json::to_value(result) {
+        Ok(value) => JsonRpcResponse::success(id, value),
+        Err(error) => JsonRpcResponse::error_response(
+            id,
+            ERR_INTERNAL,
+            &format!("Serialization error: {error}"),
+        ),
     }
 }
 
@@ -407,7 +498,11 @@ fn handle_resources_list(id: Option<Value>) -> JsonRpcResponse {
 
     match serde_json::to_value(result) {
         Ok(value) => JsonRpcResponse::success(id, value),
-        Err(e) => JsonRpcResponse::error_response(id, ERR_INTERNAL, &format!("Serialization error: {}", e)),
+        Err(e) => JsonRpcResponse::error_response(
+            id,
+            ERR_INTERNAL,
+            &format!("Serialization error: {}", e),
+        ),
     }
 }
 
@@ -434,42 +529,38 @@ async fn handle_resources_read(
     };
 
     let contents = match params.uri.as_str() {
-        "resource://browser/screenshot" => {
-            match state.browser.screenshot().await {
-                Ok(screenshot) => {
-                    vec![ResourceContents::Blob {
-                        uri: params.uri.clone(),
-                        mime_type: Some("image/png".to_string()),
-                        blob: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &screenshot.data),
-                    }]
-                }
-                Err(e) => {
-                    return JsonRpcResponse::error_response(
-                        id,
-                        ERR_INTERNAL,
-                        &format!("Failed to take screenshot: {}", e),
-                    );
-                }
+        "resource://browser/screenshot" => match state.browser.screenshot().await {
+            Ok(screenshot) => {
+                vec![ResourceContents::Blob {
+                    uri: params.uri.clone(),
+                    mime_type: Some("image/png".to_string()),
+                    blob: screenshot.data,
+                }]
             }
-        }
-        "resource://browser/snapshot" => {
-            match state.browser.snapshot().await {
-                Ok(snapshot) => {
-                    vec![ResourceContents::Text {
-                        uri: params.uri.clone(),
-                        mime_type: Some("text/plain".to_string()),
-                        text: format_snapshot(&snapshot),
-                    }]
-                }
-                Err(e) => {
-                    return JsonRpcResponse::error_response(
-                        id,
-                        ERR_INTERNAL,
-                        &format!("Failed to get snapshot: {}", e),
-                    );
-                }
+            Err(e) => {
+                return JsonRpcResponse::error_response(
+                    id,
+                    ERR_INTERNAL,
+                    &format!("Failed to take screenshot: {}", e),
+                );
             }
-        }
+        },
+        "resource://browser/snapshot" => match state.browser.snapshot().await {
+            Ok(snapshot) => {
+                vec![ResourceContents::Text {
+                    uri: params.uri.clone(),
+                    mime_type: Some("text/plain".to_string()),
+                    text: format_snapshot(&snapshot),
+                }]
+            }
+            Err(e) => {
+                return JsonRpcResponse::error_response(
+                    id,
+                    ERR_INTERNAL,
+                    &format!("Failed to get snapshot: {}", e),
+                );
+            }
+        },
         uri => {
             return JsonRpcResponse::error_response(
                 id,
@@ -482,7 +573,11 @@ async fn handle_resources_read(
     let result = ResourceReadResult { contents };
     match serde_json::to_value(result) {
         Ok(value) => JsonRpcResponse::success(id, value),
-        Err(e) => JsonRpcResponse::error_response(id, ERR_INTERNAL, &format!("Serialization error: {}", e)),
+        Err(e) => JsonRpcResponse::error_response(
+            id,
+            ERR_INTERNAL,
+            &format!("Serialization error: {}", e),
+        ),
     }
 }
 
@@ -492,35 +587,31 @@ fn handle_prompts_list(id: Option<Value>) -> JsonRpcResponse {
         Prompt {
             name: "analyze_page".to_string(),
             description: Some("Analyze the current page structure and content".to_string()),
-            arguments: Some(vec![
-                PromptArgument {
-                    name: "focus_area".to_string(),
-                    description: Some("Area to focus on (e.g., 'forms', 'links', 'content')".to_string()),
-                    required: false,
-                },
-            ]),
+            arguments: Some(vec![PromptArgument {
+                name: "focus_area".to_string(),
+                description: Some(
+                    "Area to focus on (e.g., 'forms', 'links', 'content')".to_string(),
+                ),
+                required: false,
+            }]),
         },
         Prompt {
             name: "fill_form".to_string(),
             description: Some("Guide for filling out a form on the page".to_string()),
-            arguments: Some(vec![
-                PromptArgument {
-                    name: "form_data".to_string(),
-                    description: Some("JSON object with field names and values".to_string()),
-                    required: true,
-                },
-            ]),
+            arguments: Some(vec![PromptArgument {
+                name: "form_data".to_string(),
+                description: Some("JSON object with field names and values".to_string()),
+                required: true,
+            }]),
         },
         Prompt {
             name: "extract_data".to_string(),
             description: Some("Extract structured data from the page".to_string()),
-            arguments: Some(vec![
-                PromptArgument {
-                    name: "selectors".to_string(),
-                    description: Some("CSS selectors for data to extract".to_string()),
-                    required: false,
-                },
-            ]),
+            arguments: Some(vec![PromptArgument {
+                name: "selectors".to_string(),
+                description: Some("CSS selectors for data to extract".to_string()),
+                required: false,
+            }]),
         },
     ];
 
@@ -531,7 +622,11 @@ fn handle_prompts_list(id: Option<Value>) -> JsonRpcResponse {
 
     match serde_json::to_value(result) {
         Ok(value) => JsonRpcResponse::success(id, value),
-        Err(e) => JsonRpcResponse::error_response(id, ERR_INTERNAL, &format!("Serialization error: {}", e)),
+        Err(e) => JsonRpcResponse::error_response(
+            id,
+            ERR_INTERNAL,
+            &format!("Serialization error: {}", e),
+        ),
     }
 }
 
@@ -555,55 +650,52 @@ fn handle_prompts_get(id: Option<Value>, params: Option<Value>) -> JsonRpcRespon
 
     let messages = match params.name.as_str() {
         "analyze_page" => {
-            let focus = params.arguments
+            let focus = params
+                .arguments
                 .as_ref()
                 .and_then(|a| a.get("focus_area"))
                 .map(|v| v.as_str())
                 .unwrap_or("all");
 
-            vec![
-                PromptMessage {
-                    role: "user".to_string(),
-                    content: Content::text(format!(
-                        "Please analyze the current page, focusing on: {}. Use browser_snapshot to get the page structure.",
-                        focus
-                    )),
-                },
-            ]
+            vec![PromptMessage {
+                role: "user".to_string(),
+                content: Content::text(format!(
+                    "Please analyze the current page, focusing on: {}. Use browser_snapshot to get the page structure.",
+                    focus
+                )),
+            }]
         }
         "fill_form" => {
-            let form_data = params.arguments
+            let form_data = params
+                .arguments
                 .as_ref()
                 .and_then(|a| a.get("form_data"))
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "{}".to_string());
 
-            vec![
-                PromptMessage {
-                    role: "user".to_string(),
-                    content: Content::text(format!(
-                        "Fill out the form on the current page with the following data: {}. First use browser_snapshot to identify form fields, then use browser_type for each field.",
-                        form_data
-                    )),
-                },
-            ]
+            vec![PromptMessage {
+                role: "user".to_string(),
+                content: Content::text(format!(
+                    "Fill out the form on the current page with the following data: {}. First use browser_snapshot to identify form fields, then use browser_type for each field.",
+                    form_data
+                )),
+            }]
         }
         "extract_data" => {
-            let selectors = params.arguments
+            let selectors = params
+                .arguments
                 .as_ref()
                 .and_then(|a| a.get("selectors"))
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "all text content".to_string());
 
-            vec![
-                PromptMessage {
-                    role: "user".to_string(),
-                    content: Content::text(format!(
-                        "Extract data from the page using selectors: {}. Use browser_snapshot to understand the page structure, then browser_evaluate to extract the data.",
-                        selectors
-                    )),
-                },
-            ]
+            vec![PromptMessage {
+                role: "user".to_string(),
+                content: Content::text(format!(
+                    "Extract data from the page using selectors: {}. Use browser_snapshot to understand the page structure, then browser_evaluate to extract the data.",
+                    selectors
+                )),
+            }]
         }
         name => {
             return JsonRpcResponse::error_response(
@@ -621,7 +713,11 @@ fn handle_prompts_get(id: Option<Value>, params: Option<Value>) -> JsonRpcRespon
 
     match serde_json::to_value(result) {
         Ok(value) => JsonRpcResponse::success(id, value),
-        Err(e) => JsonRpcResponse::error_response(id, ERR_INTERNAL, &format!("Serialization error: {}", e)),
+        Err(e) => JsonRpcResponse::error_response(
+            id,
+            ERR_INTERNAL,
+            &format!("Serialization error: {}", e),
+        ),
     }
 }
 
@@ -712,30 +808,6 @@ async fn execute_tool(
             Ok(result.message)
         }
 
-        "browser_screenshot" => {
-            let full_page = arguments["full_page"].as_bool();
-            let selector = arguments["selector"].as_str().map(|s| s.to_string());
-
-            let result = if full_page.is_some() || selector.is_some() {
-                state
-                    .browser
-                    .screenshot_with_options(ScreenshotOptions {
-                        full_page,
-                        selector,
-                    })
-                    .await?
-            } else {
-                state.browser.screenshot().await?
-            };
-
-            Ok(format!(
-                "Screenshot: {}x{} PNG, {} bytes",
-                result.width,
-                result.height,
-                result.data.len()
-            ))
-        }
-
         "browser_wait" => {
             let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(1000);
             let selector = arguments["selector"].as_str();
@@ -804,7 +876,10 @@ async fn execute_tool(
         "browser_wait_for_network_idle" => {
             let idle_ms = arguments["idle_ms"].as_u64().unwrap_or(500);
             let timeout_ms = arguments["timeout_ms"].as_u64().unwrap_or(30000);
-            state.browser.wait_for_network_idle(idle_ms, timeout_ms).await?;
+            state
+                .browser
+                .wait_for_network_idle(idle_ms, timeout_ms)
+                .await?;
             Ok("Network idle detected".to_string())
         }
 
@@ -865,7 +940,10 @@ async fn execute_tool(
                 timeout_ms: Some(timeout_ms),
             };
 
-            let result = state.browser.click_and_download(ref_id, Some(options)).await?;
+            let result = state
+                .browser
+                .click_and_download(ref_id, Some(options))
+                .await?;
             Ok(format!(
                 "Download complete: {} -> {}\nSize: {} bytes\nStatus: {:?}",
                 result.guid,
@@ -888,7 +966,9 @@ async fn execute_tool(
                         .filter_map(|s| match s.to_lowercase().as_str() {
                             "alt" => Some(agent_browser_core::KeyModifier::Alt),
                             "control" | "ctrl" => Some(agent_browser_core::KeyModifier::Control),
-                            "meta" | "cmd" | "command" => Some(agent_browser_core::KeyModifier::Meta),
+                            "meta" | "cmd" | "command" => {
+                                Some(agent_browser_core::KeyModifier::Meta)
+                            }
                             "shift" => Some(agent_browser_core::KeyModifier::Shift),
                             _ => None,
                         })
@@ -921,7 +1001,10 @@ async fn execute_tool(
                 _ => agent_browser_core::NavigationWaitUntil::Load,
             };
 
-            let result = state.browser.navigate_with_options(url, wait_strategy).await?;
+            let result = state
+                .browser
+                .navigate_with_options(url, wait_strategy)
+                .await?;
             Ok(format!(
                 "Navigated to {} (wait: {})\nTitle: {}\nFinal URL: {}",
                 result.url, wait_until, result.title, result.final_url
@@ -961,10 +1044,12 @@ async fn execute_tool(
         "browser_set_viewport" => {
             let width = arguments["width"]
                 .as_u64()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'width' parameter"))? as u32;
+                .ok_or_else(|| anyhow::anyhow!("Missing 'width' parameter"))?
+                as u32;
             let height = arguments["height"]
                 .as_u64()
-                .ok_or_else(|| anyhow::anyhow!("Missing 'height' parameter"))? as u32;
+                .ok_or_else(|| anyhow::anyhow!("Missing 'height' parameter"))?
+                as u32;
             let device_scale_factor = arguments["device_scale_factor"].as_f64();
 
             let viewport = agent_browser_core::ViewportSize {
@@ -988,5 +1073,34 @@ async fn execute_tool(
         }
 
         _ => Err(anyhow::anyhow!("Unknown tool: {}", tool_name)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn initialize_params() -> Value {
+        json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1.0"}
+        })
+    }
+
+    #[test]
+    fn initialize_echoes_request_id() {
+        let id = Some(json!(7));
+        let response = handle_initialize(id.clone(), Some(initialize_params()));
+        assert_eq!(response.id, id);
+        assert!(response.result.is_some());
+        assert!(response.error.is_none());
+    }
+
+    #[test]
+    fn initialize_rejects_invalid_params() {
+        let response = handle_initialize(Some(json!(8)), Some(json!({})));
+        assert_eq!(response.id, Some(json!(8)));
+        assert_eq!(response.error.unwrap().code, ERR_INVALID_PARAMS);
     }
 }

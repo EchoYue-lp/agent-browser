@@ -16,7 +16,6 @@ exclude.workspace = true
 
 [dependencies]
 tokio.workspace = true
-async-trait.workspace = true
 futures.workspace = true
 chromiumoxide.workspace = true
 serde.workspace = true

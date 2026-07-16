@@ -23,10 +23,8 @@ use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tracing::{debug, error, info, warn};
 
-use crate::protocol::{
-    ERR_INTERNAL, JsonRpcNotification, JsonRpcResponse, MCP_PROTOCOL_VERSION,
-};
 use super::Transport;
+use crate::protocol::{ERR_INTERNAL, JsonRpcNotification, JsonRpcResponse, MCP_PROTOCOL_VERSION};
 
 /// SSE 传输层配置
 #[derive(Debug, Clone)]
@@ -88,7 +86,8 @@ impl SseClientTransport {
                     &headers,
                     pending_clone,
                     notification_tx_clone,
-                ).await;
+                )
+                .await;
             })
         };
 
@@ -160,7 +159,8 @@ impl SseClientTransport {
                                     buffer = buffer[pos + 2..].to_string();
 
                                     if let Some(data) = Self::parse_sse_event(&event_block) {
-                                        Self::handle_sse_message(&data, &pending, &notification_tx).await;
+                                        Self::handle_sse_message(&data, &pending, &notification_tx)
+                                            .await;
                                     }
                                 }
                             }
@@ -213,7 +213,8 @@ impl SseClientTransport {
         };
 
         // 判断是响应还是通知
-        if json.get("id").is_some() && (json.get("result").is_some() || json.get("error").is_some()) {
+        if json.get("id").is_some() && (json.get("result").is_some() || json.get("error").is_some())
+        {
             // 响应
             match serde_json::from_value::<JsonRpcResponse>(json) {
                 Ok(response) => {
@@ -256,7 +257,12 @@ impl SseClientTransport {
 
 #[async_trait]
 impl Transport for SseClientTransport {
-    async fn send(&self, _id: Option<Value>, method: &str, params: Option<Value>) -> anyhow::Result<JsonRpcResponse> {
+    async fn send(
+        &self,
+        _id: Option<Value>,
+        method: &str,
+        params: Option<Value>,
+    ) -> anyhow::Result<JsonRpcResponse> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         // 注册等待 channel
@@ -275,7 +281,8 @@ impl Transport for SseClientTransport {
         });
 
         // 发送 POST 请求
-        let mut builder = self.client
+        let mut builder = self
+            .client
             .post(&self.config.endpoint)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
@@ -301,19 +308,15 @@ impl Transport for SseClientTransport {
 
         // 等待 SSE 推送响应
         let timeout_ms = self.config.timeout_ms;
-        let response = match tokio::time::timeout(
-            std::time::Duration::from_millis(timeout_ms),
-            rx,
-        )
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => return Err(anyhow::anyhow!("Response channel closed")),
-            Err(_) => {
-                self.pending.lock().await.remove(&id);
-                return Err(anyhow::anyhow!("Response timeout"));
-            }
-        };
+        let response =
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) => return Err(anyhow::anyhow!("Response channel closed")),
+                Err(_) => {
+                    self.pending.lock().await.remove(&id);
+                    return Err(anyhow::anyhow!("Response timeout"));
+                }
+            };
 
         Ok(response)
     }
@@ -325,7 +328,8 @@ impl Transport for SseClientTransport {
             "params": params
         });
 
-        let mut builder = self.client
+        let mut builder = self
+            .client
             .post(&self.config.endpoint)
             .header("Content-Type", "application/json")
             .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)

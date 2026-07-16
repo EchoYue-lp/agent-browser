@@ -13,7 +13,7 @@
 
 use chromiumoxide::{Browser, Page, browser::BrowserConfig as ChromeConfig};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, broadcast};
@@ -34,50 +34,85 @@ use crate::types::{
 /// - Path traversal attempts (..)
 /// - Absolute path requirements
 /// - Symlink resolution
-fn validate_file_path(path: &str) -> Result<PathBuf> {
-    let path = PathBuf::from(path);
-
-    // Check for path traversal
-    let path_str = path.to_string_lossy();
-    if path_str.contains("..") {
-        return Err(Error::InvalidPath(
-            "Path traversal detected: '..' not allowed".to_string(),
-        ));
+fn validate_file_path(path: &str, allowed_roots: &[PathBuf]) -> Result<PathBuf> {
+    let canonical = resolve_path(Path::new(path), false)?;
+    if !canonical.is_file() {
+        return Err(Error::InvalidPath(format!(
+            "Upload path is not a regular file: {}",
+            canonical.display()
+        )));
     }
-
-    // Resolve canonical path if exists, otherwise use the given path
-    let canonical = if path.exists() {
-        path.canonicalize().map_err(|e| {
-            Error::InvalidPath(format!("Failed to resolve path: {}", e))
-        })?
-    } else {
-        // For non-existent paths, check parent directory
-        if let Some(parent) = path.parent() {
-            if parent.exists() {
-                parent.canonicalize().map_err(|e| {
-                    Error::InvalidPath(format!("Failed to resolve parent path: {}", e))
-                })?;
-            }
-        }
-        path
-    };
-
+    ensure_path_allowed(&canonical, allowed_roots)?;
     Ok(canonical)
 }
 
 /// Validate a directory path for security.
-fn validate_directory_path(path: &str) -> Result<PathBuf> {
-    let path = PathBuf::from(path);
+fn validate_directory_path(path: &str, allowed_roots: &[PathBuf]) -> Result<PathBuf> {
+    let resolved = resolve_path(Path::new(path), true)?;
+    ensure_path_allowed(&resolved, allowed_roots)?;
+    Ok(resolved)
+}
 
-    // Check for path traversal
-    let path_str = path.to_string_lossy();
-    if path_str.contains("..") {
+fn resolve_path(path: &Path, allow_missing: bool) -> Result<PathBuf> {
+    if path
+        .components()
+        .any(|component| component == Component::ParentDir)
+    {
         return Err(Error::InvalidPath(
-            "Path traversal detected: '..' not allowed".to_string(),
+            "Parent-directory components are not allowed".to_string(),
         ));
     }
 
-    Ok(path)
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(Error::Io)?.join(path)
+    };
+
+    if absolute.exists() {
+        return absolute
+            .canonicalize()
+            .map_err(|e| Error::InvalidPath(format!("Failed to resolve path: {e}")));
+    }
+
+    if !allow_missing {
+        return Err(Error::InvalidPath(format!(
+            "Path does not exist: {}",
+            absolute.display()
+        )));
+    }
+
+    let mut ancestor = absolute.as_path();
+    while !ancestor.exists() {
+        ancestor = ancestor.parent().ok_or_else(|| {
+            Error::InvalidPath(format!("No existing parent for {}", absolute.display()))
+        })?;
+    }
+
+    let canonical_ancestor = ancestor
+        .canonicalize()
+        .map_err(|e| Error::InvalidPath(format!("Failed to resolve parent path: {e}")))?;
+    let suffix = absolute
+        .strip_prefix(ancestor)
+        .map_err(|e| Error::InvalidPath(format!("Failed to normalize path: {e}")))?;
+    Ok(canonical_ancestor.join(suffix))
+}
+
+fn ensure_path_allowed(path: &Path, allowed_roots: &[PathBuf]) -> Result<()> {
+    let allowed = allowed_roots.iter().any(|root| {
+        resolve_path(root, true)
+            .map(|resolved_root| path.starts_with(resolved_root))
+            .unwrap_or(false)
+    });
+
+    if allowed {
+        Ok(())
+    } else {
+        Err(Error::InvalidPath(format!(
+            "Path is outside configured allowed roots: {}",
+            path.display()
+        )))
+    }
 }
 
 /// Browser handle.
@@ -142,6 +177,8 @@ pub struct IframeContext {
 pub struct BrowserEngine {
     /// Browser instance.
     browser: Mutex<Option<Arc<Browser>>>,
+    /// Serializes browser startup so concurrent first requests launch once.
+    launch_lock: Mutex<()>,
     /// Combined tab state (single lock to prevent deadlocks).
     tab_state: Mutex<TabState>,
     /// Configuration.
@@ -150,8 +187,6 @@ pub struct BrowserEngine {
     iframe_state: Mutex<IframeState>,
     /// ref_id -> frame_id mapping (updated on each snapshot).
     iframe_mapping: Mutex<HashMap<String, String>>,
-    /// frame_id -> execution_context_id mapping.
-    execution_contexts: Mutex<HashMap<String, i64>>,
     /// Download directory.
     download_dir: Mutex<Option<PathBuf>>,
     /// Download event broadcaster.
@@ -183,12 +218,27 @@ struct IframeState {
     active_context_id: Option<i64>,
 }
 
+struct DownloadListeners {
+    begin: chromiumoxide::listeners::EventStream<
+        chromiumoxide::cdp::browser_protocol::browser::EventDownloadWillBegin,
+    >,
+    progress: chromiumoxide::listeners::EventStream<
+        chromiumoxide::cdp::browser_protocol::browser::EventDownloadProgress,
+    >,
+}
+
+enum DownloadEvent {
+    Begin(Arc<chromiumoxide::cdp::browser_protocol::browser::EventDownloadWillBegin>),
+    Progress(Arc<chromiumoxide::cdp::browser_protocol::browser::EventDownloadProgress>),
+}
+
 impl BrowserEngine {
     /// Create a new browser engine (not launched).
     pub fn new(config: BrowserConfig) -> Self {
         let (download_events, _) = broadcast::channel(16);
         Self {
             browser: Mutex::new(None),
+            launch_lock: Mutex::new(()),
             tab_state: Mutex::new(TabState {
                 active_page: None,
                 tabs: HashMap::new(),
@@ -201,7 +251,6 @@ impl BrowserEngine {
                 active_context_id: None,
             }),
             iframe_mapping: Mutex::new(HashMap::new()),
-            execution_contexts: Mutex::new(HashMap::new()),
             download_dir: Mutex::new(None),
             download_events,
             network_requests: Arc::new(Mutex::new(Vec::new())),
@@ -211,6 +260,11 @@ impl BrowserEngine {
 
     /// Launch the browser.
     pub async fn launch(&self) -> Result<BrowserHandle> {
+        let _launch_guard = self.launch_lock.lock().await;
+        if let Some(browser) = self.browser.lock().await.as_ref().cloned() {
+            return Ok(BrowserHandle(browser));
+        }
+
         let headless_str = match self.config.headless {
             HeadlessMode::None => "headed",
             HeadlessMode::Old => "headless(old)",
@@ -221,7 +275,11 @@ impl BrowserEngine {
             headless_str, self.config.stealth
         );
 
-        let mut builder = ChromeConfig::builder();
+        let mut builder = ChromeConfig::builder().request_timeout(Duration::from_millis(
+            self.config
+                .navigation_timeout_ms
+                .max(self.config.action_timeout_ms),
+        ));
 
         // 根据无头模式设置
         match self.config.headless {
@@ -289,13 +347,7 @@ impl BrowserEngine {
 
     /// 确保浏览器已启动
     async fn ensure_launched(&self) -> Result<BrowserHandle> {
-        let guard = self.browser.lock().await;
-        if let Some(ref arc) = *guard {
-            Ok(BrowserHandle(arc.clone()))
-        } else {
-            drop(guard);
-            self.launch().await
-        }
+        self.launch().await
     }
 
     /// 获取或创建活动页面
@@ -344,12 +396,46 @@ impl BrowserEngine {
         state.active_page.clone().ok_or(Error::NoActivePage)
     }
 
+    async fn evaluate_in_active_context(&self, script: &str) -> Result<serde_json::Value> {
+        use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
+
+        let page = self.active_page().await?;
+        let context_id = self.iframe_state.lock().await.active_context_id;
+        let result = if let Some(context_id) = context_id {
+            let params = EvaluateParams::builder()
+                .expression(script)
+                .context_id(ExecutionContextId::new(context_id))
+                .await_promise(true)
+                .return_by_value(true)
+                .build()
+                .map_err(Error::InvalidParameter)?;
+            page.evaluate_expression(params).await
+        } else {
+            page.evaluate(script).await
+        }
+        .map_err(|e| Error::JavaScript(e.to_string()))?;
+
+        result
+            .into_value()
+            .map_err(|e| Error::JavaScript(e.to_string()))
+    }
+
+    async fn reset_frame_state(&self) {
+        let mut iframe_state = self.iframe_state.lock().await;
+        iframe_state.iframe_stack.clear();
+        iframe_state.active_frame_id = None;
+        iframe_state.active_context_id = None;
+        drop(iframe_state);
+        self.iframe_mapping.lock().await.clear();
+    }
+
     /// 导航到 URL
     ///
     /// 如果浏览器未启动会自动启动。
     /// 导航成功后更新活动页面。
     pub async fn navigate(&self, url: &str) -> Result<crate::types::NavigateResult> {
-        self.navigate_with_options(url, NavigationWaitUntil::default()).await
+        self.navigate_with_options(url, NavigationWaitUntil::default())
+            .await
     }
 
     /// 导航到 URL，带等待策略选项
@@ -380,73 +466,65 @@ impl BrowserEngine {
 
         let page = self.get_or_create_page().await?;
 
-        // 根据等待策略选择处理方式
-        let timeout = std::time::Duration::from_millis(self.config.navigation_timeout_ms);
-        match wait_until {
-            NavigationWaitUntil::Load => {
-                // 先注册监听器，再触发导航（避免竞态条件）
-                let mut stream = page
-                    .event_listener::<EventLifecycleEvent>()
-                    .await
-                    .map_err(|e| Error::Cdp(e.to_string()))?;
+        use chromiumoxide::cdp::browser_protocol::page::NavigateParams;
 
-                page.goto(url)
+        self.reset_frame_state().await;
+        let timeout = Duration::from_millis(self.config.navigation_timeout_ms);
+        let mut lifecycle_events = if wait_until == NavigationWaitUntil::None {
+            None
+        } else {
+            Some(
+                page.event_listener::<EventLifecycleEvent>()
                     .await
-                    .map_err(|e| Error::Cdp(e.to_string()))?;
+                    .map_err(|e| Error::Cdp(e.to_string()))?,
+            )
+        };
 
-                // 等待 load 事件
-                tokio::time::timeout(timeout, async {
-                    while let Some(event) = stream.next().await {
-                        if event.name == "load" {
-                            break;
-                        }
+        let navigation = tokio::time::timeout(timeout, page.execute(NavigateParams::new(url)))
+            .await
+            .map_err(|_| Error::Timeout("Navigation command timed out".to_string()))?
+            .map_err(|e| Error::Cdp(e.to_string()))?
+            .result;
+
+        if let Some(error_text) = navigation.error_text {
+            return Err(Error::Cdp(error_text));
+        }
+
+        let expected_event = match wait_until {
+            NavigationWaitUntil::Load | NavigationWaitUntil::NetworkIdle => Some("load"),
+            NavigationWaitUntil::DomContentLoaded => Some("DOMContentLoaded"),
+            NavigationWaitUntil::None => None,
+        };
+
+        if let (Some(expected_event), Some(stream)) = (expected_event, lifecycle_events.as_mut()) {
+            let frame_id = navigation.frame_id.clone();
+            let loader_id = navigation.loader_id.clone();
+            tokio::time::timeout(timeout, async {
+                while let Some(event) = stream.next().await {
+                    if event.frame_id != frame_id || event.name != expected_event {
+                        continue;
                     }
-                    Ok::<(), Error>(())
-                })
-                .await
-                .map_err(|_| Error::Timeout("Navigation timeout waiting for load".into()))??;
-            }
-            NavigationWaitUntil::DomContentLoaded => {
-                // 先注册监听器，再触发导航（避免竞态条件）
-                let mut stream = page
-                    .event_listener::<EventLifecycleEvent>()
-                    .await
-                    .map_err(|e| Error::Cdp(e.to_string()))?;
-
-                page.goto(url)
-                    .await
-                    .map_err(|e| Error::Cdp(e.to_string()))?;
-
-                // 等待 DOMContentLoaded 事件
-                tokio::time::timeout(timeout, async {
-                    while let Some(event) = stream.next().await {
-                        if event.name == "DOMContentLoaded" {
-                            break;
-                        }
+                    if loader_id
+                        .as_ref()
+                        .is_some_and(|expected| event.loader_id != *expected)
+                    {
+                        continue;
                     }
-                    Ok::<(), Error>(())
-                })
-                .await
-                .map_err(|_| Error::Timeout("Navigation timeout waiting for DOMContentLoaded".into()))??;
-            }
-            NavigationWaitUntil::NetworkIdle => {
-                page.goto(url)
-                    .await
-                    .map_err(|e| Error::Cdp(e.to_string()))?;
+                    return Ok::<(), Error>(());
+                }
+                Err(Error::Cdp(
+                    "Navigation lifecycle event stream closed".to_string(),
+                ))
+            })
+            .await
+            .map_err(|_| {
+                Error::Timeout(format!("Navigation timeout waiting for {expected_event}"))
+            })??;
+        }
 
-                // 先等待基本导航完成，再等待网络空闲
-                tokio::time::timeout(timeout, page.wait_for_navigation())
-                    .await
-                    .map_err(|_| Error::Timeout("Navigation timeout".into()))?
-                    .map_err(|e| Error::Cdp(e.to_string()))?;
-                self.wait_for_network_idle(500, self.config.navigation_timeout_ms).await?;
-            }
-            NavigationWaitUntil::None => {
-                // 不等待任何事件
-                page.goto(url)
-                    .await
-                    .map_err(|e| Error::Cdp(e.to_string()))?;
-            }
+        if wait_until == NavigationWaitUntil::NetworkIdle {
+            self.wait_for_network_idle(500, self.config.navigation_timeout_ms)
+                .await?;
         }
 
         let final_url = page
@@ -578,7 +656,6 @@ impl BrowserEngine {
         selector: &str,
         timeout_ms: Option<u64>,
     ) -> Result<ActionResult> {
-        let page = self.active_page().await?;
         let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
 
         info!("Clicking element by selector: {}", selector);
@@ -599,12 +676,9 @@ impl BrowserEngine {
             sel = selector
         );
 
-        let result: serde_json::Value = page
-            .evaluate(click_script.as_str())
-            .await
-            .map_err(|e| Error::JavaScript(e.to_string()))?
-            .into_value()
-            .map_err(|e| Error::JavaScript(e.to_string()))?;
+        let result = self
+            .evaluate_in_active_context(click_script.as_str())
+            .await?;
 
         let clicked = result["clicked"].as_bool().unwrap_or(false);
         if clicked {
@@ -641,7 +715,6 @@ impl BrowserEngine {
         clear_first: bool,
         timeout_ms: Option<u64>,
     ) -> Result<ActionResult> {
-        let page = self.active_page().await?;
         let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
 
         info!("Typing in element by selector: {}", selector);
@@ -672,12 +745,9 @@ impl BrowserEngine {
             text = text
         );
 
-        let result: serde_json::Value = page
-            .evaluate(type_script.as_str())
-            .await
-            .map_err(|e| Error::JavaScript(e.to_string()))?
-            .into_value()
-            .map_err(|e| Error::JavaScript(e.to_string()))?;
+        let result = self
+            .evaluate_in_active_context(type_script.as_str())
+            .await?;
 
         let success = result["success"].as_bool().unwrap_or(false);
         if success {
@@ -699,7 +769,6 @@ impl BrowserEngine {
     ///
     /// 通过 CSS 选择器获取元素的文本内容。
     pub async fn get_text(&self, selector: &str, timeout_ms: Option<u64>) -> Result<String> {
-        let page = self.active_page().await?;
         let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
 
         self.wait_for_selector(selector, timeout).await?;
@@ -709,12 +778,8 @@ impl BrowserEngine {
             sel = selector
         );
 
-        let result: String = page
-            .evaluate(script.as_str())
-            .await
-            .map_err(|e| Error::JavaScript(e.to_string()))?
-            .into_value()
-            .map_err(|e| Error::JavaScript(e.to_string()))?;
+        let result: String =
+            serde_json::from_value(self.evaluate_in_active_context(script.as_str()).await?)?;
 
         Ok(result)
     }
@@ -728,7 +793,6 @@ impl BrowserEngine {
         attribute: &str,
         timeout_ms: Option<u64>,
     ) -> Result<Option<String>> {
-        let page = self.active_page().await?;
         let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
 
         self.wait_for_selector(selector, timeout).await?;
@@ -739,31 +803,21 @@ impl BrowserEngine {
             attr = attribute
         );
 
-        let result: Option<String> = page
-            .evaluate(script.as_str())
-            .await
-            .map_err(|e| Error::JavaScript(e.to_string()))?
-            .into_value()
-            .map_err(|e| Error::JavaScript(e.to_string()))?;
+        let result: Option<String> =
+            serde_json::from_value(self.evaluate_in_active_context(script.as_str()).await?)?;
 
         Ok(result)
     }
 
     /// 检查元素是否存在
     pub async fn element_exists(&self, selector: &str) -> Result<bool> {
-        let page = self.active_page().await?;
-
         let script = format!(
             r#"document.querySelector({sel:?}) !== null"#,
             sel = selector
         );
 
-        let result: bool = page
-            .evaluate(script.as_str())
-            .await
-            .map_err(|e| Error::JavaScript(e.to_string()))?
-            .into_value()
-            .map_err(|e| Error::JavaScript(e.to_string()))?;
+        let result: bool =
+            serde_json::from_value(self.evaluate_in_active_context(script.as_str()).await?)?;
 
         Ok(result)
     }
@@ -820,7 +874,6 @@ impl BrowserEngine {
         by_text: bool,
         timeout_ms: Option<u64>,
     ) -> Result<ActionResult> {
-        let page = self.active_page().await?;
         let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
 
         self.wait_for_selector(select_selector, timeout).await?;
@@ -860,12 +913,7 @@ impl BrowserEngine {
             )
         };
 
-        let result: serde_json::Value = page
-            .evaluate(script.as_str())
-            .await
-            .map_err(|e| Error::JavaScript(e.to_string()))?
-            .into_value()
-            .map_err(|e| Error::JavaScript(e.to_string()))?;
+        let result = self.evaluate_in_active_context(script.as_str()).await?;
 
         let success = result["success"].as_bool().unwrap_or(false);
         if success {
@@ -905,12 +953,9 @@ impl BrowserEngine {
                 by_text = by_text
             );
 
-            let click_result: serde_json::Value = page
-                .evaluate(click_script.as_str())
-                .await
-                .map_err(|e| Error::JavaScript(e.to_string()))?
-                .into_value()
-                .map_err(|e| Error::JavaScript(e.to_string()))?;
+            let click_result = self
+                .evaluate_in_active_context(click_script.as_str())
+                .await?;
 
             let clicked = click_result["success"].as_bool().unwrap_or(false);
             if clicked {
@@ -919,7 +964,10 @@ impl BrowserEngine {
                     message: format!("Selected option: {}", value),
                 })
             } else {
-                Err(Error::ElementNotFound(format!("Option '{}' not found", value)))
+                Err(Error::ElementNotFound(format!(
+                    "Option '{}' not found",
+                    value
+                )))
             }
         }
     }
@@ -932,7 +980,6 @@ impl BrowserEngine {
         selector: &str,
         timeout_ms: Option<u64>,
     ) -> Result<ActionResult> {
-        let page = self.active_page().await?;
         let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
 
         self.wait_for_selector(selector, timeout).await?;
@@ -964,12 +1011,7 @@ impl BrowserEngine {
             sel = selector
         );
 
-        let result: serde_json::Value = page
-            .evaluate(script.as_str())
-            .await
-            .map_err(|e| Error::JavaScript(e.to_string()))?
-            .into_value()
-            .map_err(|e| Error::JavaScript(e.to_string()))?;
+        let result = self.evaluate_in_active_context(script.as_str()).await?;
 
         let success = result["success"].as_bool().unwrap_or(false);
         if success {
@@ -1005,14 +1047,12 @@ impl BrowserEngine {
         let snapshot = snapshot::generate_snapshot(&page).await?;
 
         // 更新 iframe 映射
-        if !snapshot.iframe_mappings.is_empty() {
-            let mut mapping = self.iframe_mapping.lock().await;
-            mapping.clear();
-            for m in &snapshot.iframe_mappings {
-                mapping.insert(m.ref_id.clone(), m.frame_id.clone());
-            }
-            info!("Updated {} iframe mappings", mapping.len());
+        let mut mapping = self.iframe_mapping.lock().await;
+        mapping.clear();
+        for m in &snapshot.iframe_mappings {
+            mapping.insert(m.ref_id.clone(), m.frame_id.clone());
         }
+        info!("Updated {} iframe mappings", mapping.len());
 
         Ok(snapshot)
     }
@@ -1025,7 +1065,13 @@ impl BrowserEngine {
     /// - `action`: 动作类型
     pub async fn act(&self, ref_id: &str, action: ActionKind) -> Result<ActionResult> {
         let page = self.active_page().await?;
-        crate::actions::dispatch_action(&page, ref_id, action, None).await
+        let context_id = self.iframe_state.lock().await.active_context_id;
+        if let Some(context_id) = context_id {
+            crate::actions::dispatch_action_in_context(&page, context_id, ref_id, action, None)
+                .await
+        } else {
+            crate::actions::dispatch_action(&page, ref_id, action, None).await
+        }
     }
 
     /// 点击元素
@@ -1150,16 +1196,7 @@ impl BrowserEngine {
 
     /// 执行 JavaScript
     pub async fn evaluate(&self, script: &str) -> Result<serde_json::Value> {
-        let page = self.active_page().await?;
-
-        let result = page
-            .evaluate(script)
-            .await
-            .map_err(|e| Error::JavaScript(e.to_string()))?;
-
-        result
-            .into_value()
-            .map_err(|e| Error::JavaScript(e.to_string()))
+        self.evaluate_in_active_context(script).await
     }
 
     /// 等待指定时间
@@ -1194,6 +1231,11 @@ impl BrowserEngine {
         } else {
             false
         }
+    }
+
+    /// Whether a browser instance has been launched.
+    pub async fn is_launched(&self) -> bool {
+        self.browser.lock().await.is_some()
     }
 
     /// 关闭浏览器
@@ -1242,6 +1284,16 @@ fn parse_png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
 
     Some((width, height))
+}
+
+fn collect_snapshot_nodes<'a>(
+    nodes: &'a [crate::snapshot::SnapshotNode],
+    output: &mut Vec<&'a crate::snapshot::SnapshotNode>,
+) {
+    for node in nodes {
+        output.push(node);
+        collect_snapshot_nodes(&node.children, output);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1312,7 +1364,11 @@ impl BrowserEngine {
         let (tabs_clone, active_tab_id): (Vec<(String, Page)>, Option<String>) = {
             let state = self.tab_state.lock().await;
             (
-                state.tabs.iter().map(|(id, p)| (id.clone(), p.clone())).collect(),
+                state
+                    .tabs
+                    .iter()
+                    .map(|(id, p)| (id.clone(), p.clone()))
+                    .collect(),
                 state.active_tab_id.clone(),
             )
         };
@@ -1338,14 +1394,15 @@ impl BrowserEngine {
 
     /// 激活标签页
     pub async fn activate_tab(&self, tab_id: &str) -> Result<()> {
-        let mut state = self.tab_state.lock().await;
-
-        if !state.tabs.contains_key(tab_id) {
-            return Err(Error::Other(format!("Tab not found: {}", tab_id)));
+        {
+            let mut state = self.tab_state.lock().await;
+            if !state.tabs.contains_key(tab_id) {
+                return Err(Error::Other(format!("Tab not found: {tab_id}")));
+            }
+            state.active_tab_id = Some(tab_id.to_string());
+            state.active_page = state.tabs.get(tab_id).cloned();
         }
-
-        state.active_tab_id = Some(tab_id.to_string());
-        state.active_page = state.tabs.get(tab_id).cloned();
+        self.reset_frame_state().await;
 
         info!("Activated tab: {}", tab_id);
         Ok(())
@@ -1353,20 +1410,31 @@ impl BrowserEngine {
 
     /// 关闭标签页
     pub async fn close_tab(&self, tab_id: &str) -> Result<()> {
-        let mut state = self.tab_state.lock().await;
+        let (page, was_active) = {
+            let state = self.tab_state.lock().await;
+            let page = state
+                .tabs
+                .get(tab_id)
+                .cloned()
+                .ok_or_else(|| Error::Other(format!("Tab not found: {tab_id}")))?;
+            (page, state.active_tab_id.as_deref() == Some(tab_id))
+        };
 
-        let page = state
-            .tabs
-            .remove(tab_id)
-            .ok_or_else(|| Error::Other(format!("Tab not found: {}", tab_id)))?;
-
-        // 关闭页面
         page.close().await.map_err(|e| Error::Cdp(e.to_string()))?;
 
-        // 如果关闭的是活动标签页，切换到下一个
-        if state.active_tab_id.as_deref() == Some(tab_id) {
-            state.active_tab_id = state.tabs.keys().next().cloned();
-            state.active_page = state.active_tab_id.as_ref().and_then(|id| state.tabs.get(id).cloned());
+        {
+            let mut state = self.tab_state.lock().await;
+            state.tabs.remove(tab_id);
+            if was_active {
+                state.active_tab_id = state.tabs.keys().next().cloned();
+                state.active_page = state
+                    .active_tab_id
+                    .as_ref()
+                    .and_then(|id| state.tabs.get(id).cloned());
+            }
+        }
+        if was_active {
+            self.reset_frame_state().await;
         }
 
         info!("Closed tab: {}", tab_id);
@@ -1402,11 +1470,7 @@ impl BrowserEngine {
                 sel = selector
             );
 
-            let bounds: Option<serde_json::Value> = page
-                .evaluate(js.as_str())
-                .await
-                .ok()
-                .and_then(|v| v.into_value().ok());
+            let bounds = self.evaluate_in_active_context(js.as_str()).await.ok();
 
             if let Some(b) = bounds {
                 let x = b["x"].as_f64().unwrap_or(0.0);
@@ -1477,17 +1541,11 @@ impl BrowserEngine {
 impl BrowserEngine {
     /// 等待选择器出现
     pub async fn wait_for_selector(&self, selector: &str, timeout_ms: u64) -> Result<()> {
-        let page = self.active_page().await?;
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
 
         loop {
             let js = format!("!!document.querySelector({:?})", selector);
-            let found: bool = page
-                .evaluate(js)
-                .await
-                .ok()
-                .and_then(|v| v.into_value().ok())
-                .unwrap_or(false);
+            let found: bool = serde_json::from_value(self.evaluate_in_active_context(&js).await?)?;
 
             if found {
                 return Ok(());
@@ -1510,8 +1568,6 @@ impl BrowserEngine {
         idle_duration_ms: u64,
         timeout_ms: u64,
     ) -> Result<()> {
-        let page = self.active_page().await?;
-
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let idle_threshold = Duration::from_millis(idle_duration_ms);
         let poll_interval = Duration::from_millis(100);
@@ -1526,12 +1582,7 @@ impl BrowserEngine {
         })()"#;
 
         loop {
-            let val: serde_json::Value = page
-                .evaluate(js)
-                .await
-                .ok()
-                .and_then(|v| v.into_value().ok())
-                .unwrap_or_else(|| serde_json::json!({"ready":false,"resources":0}));
+            let val = self.evaluate_in_active_context(js).await?;
 
             let ready = val["ready"].as_bool().unwrap_or(false);
             let resources = val["resources"].as_u64().unwrap_or(0) as usize;
@@ -1550,8 +1601,9 @@ impl BrowserEngine {
             }
 
             if Instant::now() >= deadline {
-                warn!("networkidle timeout after {}ms", timeout_ms);
-                return Ok(()); // 软超时
+                return Err(Error::Timeout(format!(
+                    "Network did not become idle within {timeout_ms}ms"
+                )));
             }
 
             tokio::time::sleep(poll_interval).await;
@@ -1577,7 +1629,7 @@ impl BrowserEngine {
         };
 
         // 验证文件路径
-        let validated_path = validate_file_path(file_path)?;
+        let validated_path = validate_file_path(file_path, &self.config.allowed_file_roots)?;
 
         let page = self.active_page().await?;
         let selector = format!("[data-agent-ref=\"{}\"]", ref_id);
@@ -1766,37 +1818,25 @@ impl BrowserEngine {
 
     /// 获取指定 frame 的执行上下文 ID
     async fn get_frame_execution_context(&self, frame_id: &str) -> Result<i64> {
+        use chromiumoxide::cdp::browser_protocol::page::CreateIsolatedWorldParams;
+
         let page = self.active_page().await?;
 
-        // 检查缓存
-        {
-            let cache = self.execution_contexts.lock().await;
-            if let Some(&ctx_id) = cache.get(frame_id) {
-                return Ok(ctx_id);
-            }
-        }
-
-        // 首先尝试使用 page 的 execution_context（适用于主 frame）
-        match page.execution_context().await {
-            Ok(Some(ctx_id)) => {
-                // ExecutionContextId 使用 inner() 方法获取内部的 i64
-                let ctx_id = *ctx_id.inner();
-                info!("Got execution context {} from page", ctx_id);
-
-                // 缓存
-                let mut cache = self.execution_contexts.lock().await;
-                cache.insert(frame_id.to_string(), ctx_id);
-
-                return Ok(ctx_id);
-            }
-            _ => {
-                warn!("No execution context available from page");
-            }
-        }
-
-        // 如果无法获取上下文，返回一个默认值
-        warn!("Using default execution context for frame {}", frame_id);
-        Ok(0)
+        let context = page
+            .execute(
+                CreateIsolatedWorldParams::builder()
+                    .frame_id(frame_id.to_string())
+                    .world_name("agent-browser")
+                    .grant_univeral_access(false)
+                    .build()
+                    .map_err(Error::InvalidParameter)?,
+            )
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?
+            .result
+            .execution_context_id;
+        let context_id = *context.inner();
+        Ok(context_id)
     }
 
     /// 退出 iframe
@@ -1818,8 +1858,7 @@ impl BrowserEngine {
             if let Some(ref ctx) = popped {
                 info!(
                     "Exited iframe: frame_id={}, depth={}",
-                    ctx.frame_id,
-                    current_depth
+                    ctx.frame_id, current_depth
                 );
             }
             (parent, current_depth)
@@ -1866,59 +1905,7 @@ impl BrowserEngine {
     ///
     /// 如果当前在 iframe 上下文中，将尝试在该 iframe 内执行脚本。
     pub async fn evaluate_in_context(&self, script: &str) -> Result<serde_json::Value> {
-        let page = self.active_page().await?;
-        let iframe_state = self.iframe_state.lock().await.clone();
-
-        if let Some(ctx) = iframe_state.iframe_stack.last() {
-            // 在 iframe 上下文中执行
-            info!("Evaluating script in iframe context: {}", ctx.frame_id);
-
-            // 使用 JavaScript 在 iframe 中执行
-            // 注意：对于跨域 iframe，这种方法可能受限
-            let wrapped_script = format!(
-                r#"(function() {{
-                    const iframes = document.querySelectorAll('iframe');
-                    for (const iframe of iframes) {{
-                        try {{
-                            if (iframe.name === '{frame_id}' ||
-                                iframe.src.includes('{frame_id}')) {{
-                                return iframe.contentWindow.eval({script:?});
-                            }}
-                        }} catch (e) {{
-                            // 跨域限制
-                        }}
-                    }}
-                    // 尝试通过 frame name 访问
-                    try {{
-                        if (window.frames['{frame_id}']) {{
-                            return window.frames['{frame_id}'].eval({script:?});
-                        }}
-                    }} catch (e) {{}}
-                    throw new Error('iframe not accessible');
-                }})()"#,
-                frame_id = ctx.frame_id,
-                script = script
-            );
-
-            let result = page
-                .evaluate(wrapped_script.as_str())
-                .await
-                .map_err(|e| Error::JavaScript(e.to_string()))?;
-
-            result
-                .into_value()
-                .map_err(|e| Error::JavaScript(e.to_string()))
-        } else {
-            // 在主文档上下文中执行
-            let result = page
-                .evaluate(script)
-                .await
-                .map_err(|e| Error::JavaScript(e.to_string()))?;
-
-            result
-                .into_value()
-                .map_err(|e| Error::JavaScript(e.to_string()))
-        }
+        self.evaluate_in_active_context(script).await
     }
 
     /// 获取当前 iframe 的快照
@@ -2061,7 +2048,7 @@ impl BrowserEngine {
 
         // 确定下载目录（验证自定义路径）
         let download_dir = if let Some(path) = save_path {
-            validate_directory_path(path)?
+            validate_directory_path(path, &self.config.allowed_file_roots)?
         } else {
             // 默认使用临时目录
             std::env::temp_dir().join("echo-browser-downloads")
@@ -2099,83 +2086,108 @@ impl BrowserEngine {
         guid: Option<&str>,
         timeout_ms: u64,
     ) -> Result<DownloadResult> {
+        let listeners = self.create_download_listeners().await?;
+        self.wait_for_download_with_listeners(listeners, guid, timeout_ms)
+            .await
+    }
+
+    async fn create_download_listeners(&self) -> Result<DownloadListeners> {
         use chromiumoxide::cdp::browser_protocol::browser::{
-            DownloadProgressState, EventDownloadProgress,
+            EventDownloadProgress, EventDownloadWillBegin,
         };
-        use futures::StreamExt;
 
         let page = self.active_page().await?;
-        let timeout = Duration::from_millis(timeout_ms);
-        let start = Instant::now();
-
-        // 监听下载进度事件
-        let mut events = page
+        let begin = page
+            .event_listener::<EventDownloadWillBegin>()
+            .await
+            .map_err(|e| Error::Cdp(e.to_string()))?;
+        let progress = page
             .event_listener::<EventDownloadProgress>()
             .await
             .map_err(|e| Error::Cdp(e.to_string()))?;
+        Ok(DownloadListeners { begin, progress })
+    }
+
+    async fn wait_for_download_with_listeners(
+        &self,
+        mut listeners: DownloadListeners,
+        guid: Option<&str>,
+        timeout_ms: u64,
+    ) -> Result<DownloadResult> {
+        use chromiumoxide::cdp::browser_protocol::browser::DownloadProgressState;
+        use futures::StreamExt;
+
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut downloads: HashMap<String, String> = HashMap::new();
 
         loop {
-            if start.elapsed() > timeout {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(Error::Timeout("Download wait timeout".to_string()));
             }
 
-            // 使用 tokio::time::timeout 来处理超时
-            match tokio::time::timeout(Duration::from_millis(100), events.next()).await {
-                Ok(Some(event)) => {
-                    // If guid is specified, check if it matches
-                    if let Some(g) = guid
-                        && event.guid != g
-                    {
+            let event = tokio::time::timeout(remaining, async {
+                tokio::select! {
+                    event = listeners.begin.next() => event.map(DownloadEvent::Begin),
+                    event = listeners.progress.next() => event.map(DownloadEvent::Progress),
+                }
+            })
+            .await
+            .map_err(|_| Error::Timeout("Download wait timeout".to_string()))?
+            .ok_or_else(|| Error::Cdp("Download event stream closed".to_string()))?;
+
+            match event {
+                DownloadEvent::Begin(event) => {
+                    downloads.insert(event.guid.clone(), event.suggested_filename.clone());
+                }
+                DownloadEvent::Progress(event) => {
+                    if guid.is_some_and(|expected| event.guid != expected) {
                         continue;
                     }
-
-                    let state = match event.state {
-                        DownloadProgressState::InProgress => DownloadStatus::InProgress,
-                        DownloadProgressState::Completed => DownloadStatus::Completed,
-                        DownloadProgressState::Canceled => DownloadStatus::Canceled,
-                    };
-
-                    // 检查是否完成
-                    match state {
-                        DownloadStatus::Completed
-                        | DownloadStatus::Canceled => {
-                            let download_dir = self.download_dir.lock().await.clone();
-                            let filename = format!("download_{}", event.guid);
-                            let file_path = if let Some(ref dir) = download_dir {
-                                dir.join(&filename)
-                            } else {
-                                PathBuf::from(&filename)
-                            };
-
-                            let result = DownloadResult {
-                                guid: event.guid.clone(),
-                                filename: filename.clone(),
-                                file_path: file_path.to_string_lossy().to_string(),
-                                size: Some(event.received_bytes as u64),
-                                mime_type: None,
-                                status: state,
-                            };
-
-                            // 广播下载完成事件
-                            let _ = self.download_events.send(result.clone());
-
-                            info!("Download completed: {} -> {:?}", event.guid, file_path);
-                            return Ok(result);
-                        }
-                        _ => {
-                            // 继续等待
+                    match event.state {
+                        DownloadProgressState::InProgress => {
                             debug!(
-                                "Download in progress: {} ({:?})",
+                                "Download in progress: {} ({} bytes)",
                                 event.guid, event.received_bytes
                             );
                         }
+                        DownloadProgressState::Canceled => {
+                            return Err(Error::Other(format!("Download canceled: {}", event.guid)));
+                        }
+                        DownloadProgressState::Completed => {
+                            let filename = downloads
+                                .get(&event.guid)
+                                .cloned()
+                                .or_else(|| {
+                                    event.file_path.as_ref().and_then(|path| {
+                                        Path::new(path)
+                                            .file_name()
+                                            .map(|name| name.to_string_lossy().into_owned())
+                                    })
+                                })
+                                .unwrap_or_else(|| format!("download-{}", event.guid));
+                            let download_dir = self.download_dir.lock().await.clone();
+                            let file_path = event
+                                .file_path
+                                .as_ref()
+                                .map(PathBuf::from)
+                                .or_else(|| download_dir.map(|dir| dir.join(&filename)));
+                            let file_path = file_path.ok_or_else(|| {
+                                Error::Other("Download completed without a file path".to_string())
+                            })?;
+                            let result = DownloadResult {
+                                guid: event.guid.clone(),
+                                filename,
+                                file_path: file_path.to_string_lossy().into_owned(),
+                                size: Some(event.received_bytes as u64),
+                                mime_type: None,
+                                status: DownloadStatus::Completed,
+                            };
+                            let _ = self.download_events.send(result.clone());
+                            info!("Download completed: {} -> {:?}", event.guid, file_path);
+                            return Ok(result);
+                        }
                     }
-                }
-                Ok(None) => {
-                    return Err(Error::Cdp("Download event stream closed".to_string()));
-                }
-                Err(_) => {
-                    // 超时，继续循环检查
                 }
             }
         }
@@ -2194,6 +2206,7 @@ impl BrowserEngine {
 
         // 设置下载目录
         let _download_dir = self.setup_download(opts.save_path.as_deref()).await?;
+        let listeners = self.create_download_listeners().await?;
 
         // 记录当前 URL
         let page = self.active_page().await?;
@@ -2222,7 +2235,8 @@ impl BrowserEngine {
         info!("Download triggered: {}", url);
 
         // 等待下载完成
-        self.wait_for_download(None, timeout).await
+        self.wait_for_download_with_listeners(listeners, None, timeout)
+            .await
     }
 
     /// 点击元素并等待下载
@@ -2238,6 +2252,7 @@ impl BrowserEngine {
 
         // 设置下载目录
         self.setup_download(opts.save_path.as_deref()).await?;
+        let listeners = self.create_download_listeners().await?;
 
         // 点击元素
         self.click(ref_id).await?;
@@ -2245,7 +2260,8 @@ impl BrowserEngine {
         info!("Clicked element {} for download", ref_id);
 
         // 等待下载完成
-        self.wait_for_download(None, timeout).await
+        self.wait_for_download_with_listeners(listeners, None, timeout)
+            .await
     }
 
     /// 获取下载目录
@@ -2528,7 +2544,10 @@ impl BrowserEngine {
     /// 在指定的时间窗口内收集所有网络请求事件。
     /// # 参数
     /// - `duration_ms`: 监听持续时间（毫秒）
-    pub async fn listen_network_requests(&self, duration_ms: u64) -> Result<Vec<crate::types::NetworkRequest>> {
+    pub async fn listen_network_requests(
+        &self,
+        duration_ms: u64,
+    ) -> Result<Vec<crate::types::NetworkRequest>> {
         use chromiumoxide::cdp::browser_protocol::network::EventRequestWillBeSent;
         use futures::StreamExt;
 
@@ -2537,7 +2556,9 @@ impl BrowserEngine {
         // 确保启用了 Network 域
         self.enable_network().await?;
 
-        let mut stream = page.event_listener::<EventRequestWillBeSent>().await
+        let mut stream = page
+            .event_listener::<EventRequestWillBeSent>()
+            .await
             .map_err(|e| Error::Cdp(e.to_string()))?;
 
         let mut requests = Vec::new();
@@ -2547,7 +2568,8 @@ impl BrowserEngine {
             let remaining = deadline.saturating_duration_since(Instant::now());
             match tokio::time::timeout(remaining, stream.next()).await {
                 Ok(Some(event)) => {
-                    let resource_type = event.r#type
+                    let resource_type = event
+                        .r#type
                         .as_ref()
                         .map(|t| t.as_ref().to_string())
                         .unwrap_or_default();
@@ -2557,7 +2579,11 @@ impl BrowserEngine {
                         method: event.request.method.clone(),
                         resource_type,
                         headers: event.request.headers.inner().clone(),
-                        post_data: event.request.has_post_data.unwrap_or(false).then_some(String::new()),
+                        post_data: event
+                            .request
+                            .has_post_data
+                            .unwrap_or(false)
+                            .then_some(String::new()),
                     });
                 }
                 Ok(None) => break,
@@ -2565,7 +2591,11 @@ impl BrowserEngine {
             }
         }
 
-        info!("Collected {} network requests in {}ms", requests.len(), duration_ms);
+        info!(
+            "Collected {} network requests in {}ms",
+            requests.len(),
+            duration_ms
+        );
         Ok(requests)
     }
 
@@ -2573,14 +2603,19 @@ impl BrowserEngine {
     ///
     /// # 参数
     /// - `duration_ms`: 监听持续时间（毫秒）
-    pub async fn listen_network_responses(&self, duration_ms: u64) -> Result<Vec<crate::types::NetworkResponse>> {
+    pub async fn listen_network_responses(
+        &self,
+        duration_ms: u64,
+    ) -> Result<Vec<crate::types::NetworkResponse>> {
         use chromiumoxide::cdp::browser_protocol::network::EventResponseReceived;
         use futures::StreamExt;
 
         let page = self.active_page().await?;
         self.enable_network().await?;
 
-        let mut stream = page.event_listener::<EventResponseReceived>().await
+        let mut stream = page
+            .event_listener::<EventResponseReceived>()
+            .await
             .map_err(|e| Error::Cdp(e.to_string()))?;
 
         let mut responses = Vec::new();
@@ -2605,7 +2640,11 @@ impl BrowserEngine {
             }
         }
 
-        info!("Collected {} network responses in {}ms", responses.len(), duration_ms);
+        info!(
+            "Collected {} network responses in {}ms",
+            responses.len(),
+            duration_ms
+        );
         Ok(responses)
     }
 
@@ -2618,7 +2657,8 @@ impl BrowserEngine {
 
         let page = self.active_page().await?;
         let params = GetResponseBodyParams::new(RequestId::from(request_id.to_string()));
-        let result = page.execute(params)
+        let result = page
+            .execute(params)
             .await
             .map_err(|e| Error::Cdp(e.to_string()))?;
 
@@ -2652,11 +2692,15 @@ impl BrowserEngine {
 
         if block {
             // 监听暂停的请求并阻止它们
-            use chromiumoxide::cdp::browser_protocol::fetch::{EventRequestPaused, FailRequestParams};
+            use chromiumoxide::cdp::browser_protocol::fetch::{
+                EventRequestPaused, FailRequestParams,
+            };
             use chromiumoxide::cdp::browser_protocol::network::ErrorReason;
             use futures::StreamExt;
 
-            let mut stream = page.event_listener::<EventRequestPaused>().await
+            let mut stream = page
+                .event_listener::<EventRequestPaused>()
+                .await
                 .map_err(|e| Error::Cdp(e.to_string()))?;
 
             tokio::spawn(async move {
@@ -2669,7 +2713,10 @@ impl BrowserEngine {
             });
         }
 
-        info!("Request interception enabled for pattern: {} (block: {})", url_pattern, block);
+        info!(
+            "Request interception enabled for pattern: {} (block: {})",
+            url_pattern, block
+        );
         Ok(())
     }
 
@@ -2697,7 +2744,10 @@ impl BrowserEngine {
     /// 在指定的时间窗口内收集所有 console 输出。
     /// # 参数
     /// - `duration_ms`: 监听持续时间（毫秒）
-    pub async fn listen_console(&self, duration_ms: u64) -> Result<Vec<crate::types::ConsoleMessage>> {
+    pub async fn listen_console(
+        &self,
+        duration_ms: u64,
+    ) -> Result<Vec<crate::types::ConsoleMessage>> {
         use chromiumoxide::cdp::js_protocol::runtime::EventConsoleApiCalled;
         use futures::StreamExt;
 
@@ -2709,7 +2759,9 @@ impl BrowserEngine {
             .await
             .map_err(|e| Error::Cdp(e.to_string()))?;
 
-        let mut stream = page.event_listener::<EventConsoleApiCalled>().await
+        let mut stream = page
+            .event_listener::<EventConsoleApiCalled>()
+            .await
             .map_err(|e| Error::Cdp(e.to_string()))?;
 
         let mut messages = Vec::new();
@@ -2720,10 +2772,15 @@ impl BrowserEngine {
             match tokio::time::timeout(remaining, stream.next()).await {
                 Ok(Some(event)) => {
                     let level = event.r#type.as_ref().to_string();
-                    let text: String = event.args
+                    let text: String = event
+                        .args
                         .iter()
                         .filter_map(|v| v.value.as_ref())
-                        .filter_map(|v| v.as_str().map(|s| s.to_string()).or_else(|| Some(v.to_string())))
+                        .filter_map(|v| {
+                            v.as_str()
+                                .map(|s| s.to_string())
+                                .or_else(|| Some(v.to_string()))
+                        })
                         .collect::<Vec<_>>()
                         .join(" ");
 
@@ -2743,7 +2800,11 @@ impl BrowserEngine {
             }
         }
 
-        info!("Collected {} console messages in {}ms", messages.len(), duration_ms);
+        info!(
+            "Collected {} console messages in {}ms",
+            messages.len(),
+            duration_ms
+        );
         Ok(messages)
     }
 }
@@ -2787,7 +2848,11 @@ impl BrowserEngine {
     /// # 参数
     /// - `label`: label 文本
     /// - `timeout_ms`: 等待超时
-    pub async fn click_by_label(&self, label: &str, timeout_ms: Option<u64>) -> Result<ActionResult> {
+    pub async fn click_by_label(
+        &self,
+        label: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<ActionResult> {
         let ref_id = self.find_by_label(label, timeout_ms).await?;
         self.click(&ref_id).await
     }
@@ -2829,7 +2894,9 @@ impl BrowserEngine {
 
         loop {
             let snapshot = self.snapshot().await?;
-            for node in &snapshot.nodes {
+            let mut nodes = Vec::new();
+            collect_snapshot_nodes(&snapshot.nodes, &mut nodes);
+            for node in nodes {
                 if node.role == role {
                     if let Some(n) = name {
                         if node.name.contains(n) {
@@ -2845,7 +2912,8 @@ impl BrowserEngine {
                 return Err(Error::ElementNotFound(format!(
                     "No element with role '{}'{} found",
                     role,
-                    name.map(|n| format!(" and name containing '{}'", n)).unwrap_or_default()
+                    name.map(|n| format!(" and name containing '{}'", n))
+                        .unwrap_or_default()
                 )));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2853,74 +2921,37 @@ impl BrowserEngine {
     }
 
     /// 通过文本内容查找元素的 ref_id
-    pub async fn find_by_text(
-        &self,
-        text: &str,
-        timeout_ms: Option<u64>,
-    ) -> Result<String> {
+    pub async fn find_by_text(&self, text: &str, timeout_ms: Option<u64>) -> Result<String> {
         let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
         let deadline = Instant::now() + Duration::from_millis(timeout);
 
         loop {
             let snapshot = self.snapshot().await?;
-            for node in &snapshot.nodes {
-                if node.name.contains(text) || node.value.as_ref().map_or(false, |v| v.contains(text)) {
+            let mut nodes = Vec::new();
+            collect_snapshot_nodes(&snapshot.nodes, &mut nodes);
+            for node in &nodes {
+                if node.name.contains(text)
+                    || node
+                        .value
+                        .as_ref()
+                        .is_some_and(|value| value.contains(text))
+                {
                     // 优先匹配可交互元素
-                    let interactive_roles = ["button", "link", "menuitem", "tab", "option", "radio", "checkbox"];
+                    let interactive_roles = [
+                        "button", "link", "menuitem", "tab", "option", "radio", "checkbox",
+                    ];
                     if interactive_roles.contains(&node.role.as_str()) {
                         return Ok(node.ref_id.clone());
                     }
                 }
             }
             // 如果没有找到可交互元素，再找任何包含文本的元素
-            for node in &snapshot.nodes {
-                if node.name.contains(text) || node.value.as_ref().map_or(false, |v| v.contains(text)) {
-                    return Ok(node.ref_id.clone());
-                }
-            }
-
-            if Instant::now() >= deadline {
-                return Err(Error::ElementNotFound(format!(
-                    "No element with text '{}' found", text
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    }
-
-    /// 通过 label 查找元素的 ref_id
-    pub async fn find_by_label(
-        &self,
-        label: &str,
-        timeout_ms: Option<u64>,
-    ) -> Result<String> {
-        let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
-        let deadline = Instant::now() + Duration::from_millis(timeout);
-
-        loop {
-            let snapshot = self.snapshot().await?;
-            // 先查找 label 元素，然后找它关联的表单元素
-            for node in &snapshot.nodes {
-                if node.role == "label" && node.name.contains(label) {
-                    // label 的子元素通常是它标记的表单元素
-                    if let Some(child) = node.children.first() {
-                        return Ok(child.ref_id.clone());
-                    }
-                }
-                // 也检查具有 label 属性的元素
-                if let Some(labeled_by) = node.attributes.get("labelledby") {
-                    if !labeled_by.is_empty() {
-                        // 查找对应的 label 元素
-                        for label_node in &snapshot.nodes {
-                            if label_node.name.contains(label) {
-                                return Ok(node.ref_id.clone());
-                            }
-                        }
-                    }
-                }
-                // 检查 aria-label 或 title 包含 label 文本
-                if node.attributes.get("aria-label").map_or(false, |v| v.contains(label))
-                    || node.attributes.get("title").map_or(false, |v| v.contains(label))
+            for node in nodes {
+                if node.name.contains(text)
+                    || node
+                        .value
+                        .as_ref()
+                        .is_some_and(|value| value.contains(text))
                 {
                     return Ok(node.ref_id.clone());
                 }
@@ -2928,7 +2959,63 @@ impl BrowserEngine {
 
             if Instant::now() >= deadline {
                 return Err(Error::ElementNotFound(format!(
-                    "No element with label '{}' found", label
+                    "No element with text '{}' found",
+                    text
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// 通过 label 查找元素的 ref_id
+    pub async fn find_by_label(&self, label: &str, timeout_ms: Option<u64>) -> Result<String> {
+        let timeout = timeout_ms.unwrap_or(self.config.action_timeout_ms);
+        let deadline = Instant::now() + Duration::from_millis(timeout);
+
+        loop {
+            let snapshot = self.snapshot().await?;
+            let mut nodes = Vec::new();
+            collect_snapshot_nodes(&snapshot.nodes, &mut nodes);
+            let form_roles = [
+                "textbox",
+                "searchbox",
+                "combobox",
+                "checkbox",
+                "radio",
+                "slider",
+                "spinbutton",
+            ];
+
+            for node in nodes {
+                if form_roles.contains(&node.role.as_str()) && node.name.contains(label) {
+                    return Ok(node.ref_id.clone());
+                }
+                if node.role == "label" && node.name.contains(label) {
+                    if let Some(child) = node
+                        .children
+                        .iter()
+                        .find(|child| form_roles.contains(&child.role.as_str()))
+                    {
+                        return Ok(child.ref_id.clone());
+                    }
+                }
+                if node
+                    .attributes
+                    .get("aria-label")
+                    .is_some_and(|value| value.contains(label))
+                    || node
+                        .attributes
+                        .get("title")
+                        .is_some_and(|value| value.contains(label))
+                {
+                    return Ok(node.ref_id.clone());
+                }
+            }
+
+            if Instant::now() >= deadline {
+                return Err(Error::ElementNotFound(format!(
+                    "No element with label '{}' found",
+                    label
                 )));
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2995,8 +3082,10 @@ impl BrowserEngine {
             .await
             .map_err(|e| Error::Cdp(e.to_string()))?;
 
-        info!("Viewport set to {}x{} (scale: {:?})",
-            viewport.width, viewport.height, viewport.device_scale_factor);
+        info!(
+            "Viewport set to {}x{} (scale: {:?})",
+            viewport.width, viewport.height, viewport.device_scale_factor
+        );
         Ok(())
     }
 
@@ -3010,7 +3099,8 @@ impl BrowserEngine {
             devicePixelRatio: window.devicePixelRatio
         })"#;
 
-        let result: serde_json::Value = page.evaluate(script)
+        let result: serde_json::Value = page
+            .evaluate(script)
             .await
             .map_err(|e| Error::JavaScript(e.to_string()))?
             .into_value()
@@ -3031,7 +3121,12 @@ impl BrowserEngine {
             "ipad" | "ipad pro" => (1024, 1366, 2.0, true),
             "pixel" | "pixel 7" => (412, 915, 2.625, true),
             "galaxy" | "galaxy s21" => (360, 800, 3.0, true),
-            _ => return Err(Error::InvalidParameter(format!("Unknown device: {}", device_name))),
+            _ => {
+                return Err(Error::InvalidParameter(format!(
+                    "Unknown device: {}",
+                    device_name
+                )));
+            }
         };
 
         use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
@@ -3073,7 +3168,11 @@ impl Drop for BrowserEngine {
     fn drop(&mut self) {
         // 尝试优雅关闭浏览器
         // 由于 Drop 不能是 async，使用 block_on 来执行清理
-        let browser = self.browser.try_lock().ok().and_then(|mut guard| guard.take());
+        let browser = self
+            .browser
+            .try_lock()
+            .ok()
+            .and_then(|mut guard| guard.take());
         if let Some(browser) = browser {
             info!("BrowserEngine dropped, cleaning up browser process");
             // 使用 std::thread 在后台尝试关闭
@@ -3082,7 +3181,7 @@ impl Drop for BrowserEngine {
                     .enable_all()
                     .build();
                 if let Ok(rt) = rt {
-                    let _ = rt.block_on(async {
+                    rt.block_on(async {
                         // 关闭所有页面
                         if let Ok(pages) = browser.pages().await {
                             for page in pages {
@@ -3091,8 +3190,15 @@ impl Drop for BrowserEngine {
                         }
                         // 关闭浏览器
                         match Arc::try_unwrap(browser) {
-                            Ok(mut b) => { let _ = b.close().await; }
-                            Err(arc) => { info!("Browser has {} remaining references", Arc::strong_count(&arc)); }
+                            Ok(mut b) => {
+                                let _ = b.close().await;
+                            }
+                            Err(arc) => {
+                                info!(
+                                    "Browser has {} remaining references",
+                                    Arc::strong_count(&arc)
+                                );
+                            }
                         }
                     });
                 }
@@ -3131,16 +3237,28 @@ impl BrowserEngine {
 
         tokio::spawn(async move {
             while let Some(event) = events.next().await {
-                let post_data = event.request.post_data_entries.as_ref().and_then(|entries| {
-                    entries.first().and_then(|e| e.bytes.clone()).map(String::from)
-                });
+                let post_data = event
+                    .request
+                    .post_data_entries
+                    .as_ref()
+                    .and_then(|entries| {
+                        entries
+                            .first()
+                            .and_then(|e| e.bytes.clone())
+                            .map(String::from)
+                    });
 
                 let request = crate::types::NetworkRequest {
                     request_id: event.request_id.as_ref().to_string(),
                     url: event.request.url.clone(),
                     method: event.request.method.clone(),
-                    resource_type: event.r#type.as_ref().map(|t| format!("{:?}", t)).unwrap_or_default(),
-                    headers: serde_json::to_value(&event.request.headers).unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
+                    resource_type: event
+                        .r#type
+                        .as_ref()
+                        .map(|t| format!("{:?}", t))
+                        .unwrap_or_default(),
+                    headers: serde_json::to_value(&event.request.headers)
+                        .unwrap_or(serde_json::Value::Object(serde_json::Map::new())),
                     post_data,
                 };
 
@@ -3202,7 +3320,9 @@ impl BrowserEngine {
         tokio::spawn(async move {
             while let Some(event) = events.next().await {
                 // 解析消息文本
-                let text = event.args.iter()
+                let text = event
+                    .args
+                    .iter()
                     .filter_map(|arg| {
                         // 尝试从 RemoteObject 获取值
                         if let Some(ref value) = arg.value {
@@ -3223,7 +3343,9 @@ impl BrowserEngine {
                     .join(" ");
 
                 // 处理 stack_trace (Arc<StackTrace>)
-                let (url, line_number) = event.stack_trace.as_ref()
+                let (url, line_number) = event
+                    .stack_trace
+                    .as_ref()
                     .and_then(|st| st.call_frames.first())
                     .map(|f| (Some(f.url.clone()), Some(f.line_number)))
                     .unwrap_or((None, None));
@@ -3260,6 +3382,67 @@ impl BrowserEngine {
     pub async fn clear_console_messages(&self) -> Result<()> {
         self.console_messages.lock().await.clear();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshot::SnapshotNode;
+
+    fn node(ref_id: &str, children: Vec<SnapshotNode>) -> SnapshotNode {
+        SnapshotNode {
+            ref_id: ref_id.to_string(),
+            role: "generic".to_string(),
+            name: String::new(),
+            value: None,
+            description: None,
+            bounds: None,
+            attributes: HashMap::new(),
+            children,
+        }
+    }
+
+    #[test]
+    fn collect_snapshot_nodes_is_recursive() {
+        let nodes = vec![node(
+            "root",
+            vec![node("child", vec![node("leaf", vec![])])],
+        )];
+        let mut collected = Vec::new();
+        collect_snapshot_nodes(&nodes, &mut collected);
+        let refs: Vec<&str> = collected.iter().map(|node| node.ref_id.as_str()).collect();
+        assert_eq!(refs, vec!["root", "child", "leaf"]);
+    }
+
+    #[test]
+    fn file_paths_are_restricted_to_allowed_roots() {
+        let root = std::env::temp_dir().join(format!("agent-browser-{}", uuid::Uuid::new_v4()));
+        let outside = std::env::temp_dir().join(format!("agent-browser-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("create allowed root");
+        std::fs::create_dir_all(&outside).expect("create outside root");
+        let allowed_file = root.join("upload.txt");
+        let outside_file = outside.join("secret.txt");
+        std::fs::write(&allowed_file, "allowed").expect("write allowed file");
+        std::fs::write(&outside_file, "outside").expect("write outside file");
+
+        assert!(
+            validate_file_path(allowed_file.to_str().unwrap(), std::slice::from_ref(&root)).is_ok()
+        );
+        assert!(
+            validate_file_path(outside_file.to_str().unwrap(), std::slice::from_ref(&root))
+                .is_err()
+        );
+        assert!(
+            validate_directory_path(
+                root.join("downloads/new").to_str().unwrap(),
+                std::slice::from_ref(&root)
+            )
+            .is_ok()
+        );
+
+        std::fs::remove_dir_all(root).expect("remove allowed root");
+        std::fs::remove_dir_all(outside).expect("remove outside root");
     }
 }
 

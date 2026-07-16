@@ -80,10 +80,12 @@ let config = BrowserConfig::headless_old();
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `BROWSER_HTTP_HOST` | Bind address; non-loopback requires an API key | `127.0.0.1` |
 | `BROWSER_HTTP_PORT` | Server port | `3000` |
-| `BROWSER_HEADLESS` | Enable headless mode (any value) | - |
+| `BROWSER_HEADLESS` | `false` for headed, `old` for legacy headless, otherwise new headless | new headless |
 | `BROWSER_API_KEY` | API key for authentication | - |
 | `BROWSER_DEFAULT_TIMEOUT_MS` | Default timeout in milliseconds | `30000` |
+| `BROWSER_ALLOWED_FILE_ROOTS` | Platform-separated upload/download roots | current directory and temp directory |
 
 ### Example
 
@@ -92,6 +94,7 @@ let config = BrowserConfig::headless_old();
 BROWSER_HTTP_PORT=8080 \
 BROWSER_HEADLESS=1 \
 BROWSER_API_KEY=secret123 \
+BROWSER_ALLOWED_FILE_ROOTS=/tmp:/path/to/workspace \
 BROWSER_DEFAULT_TIMEOUT_MS=60000 \
 ./target/release/agent-browser-http
 ```

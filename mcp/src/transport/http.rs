@@ -19,10 +19,8 @@ use serde_json::Value;
 use tokio::sync::{Mutex, broadcast, oneshot};
 use tracing::{debug, error, info, warn};
 
-use crate::protocol::{
-    JsonRpcNotification, JsonRpcResponse, MCP_PROTOCOL_VERSION,
-};
 use super::Transport;
+use crate::protocol::{JsonRpcNotification, JsonRpcResponse, MCP_PROTOCOL_VERSION};
 
 /// HTTP 传输层配置
 #[derive(Debug, Clone)]
@@ -95,7 +93,15 @@ impl HttpClientTransport {
         let notification_tx = self.notification_tx.clone();
 
         let task = tokio::spawn(async move {
-            Self::run_sse_listener(client, &endpoint, &headers, session_id, pending, notification_tx).await;
+            Self::run_sse_listener(
+                client,
+                &endpoint,
+                &headers,
+                session_id,
+                pending,
+                notification_tx,
+            )
+            .await;
         });
 
         self._sse_task = Some(task);
@@ -140,7 +146,10 @@ impl HttpClientTransport {
                     }
 
                     if !response.status().is_success() {
-                        warn!("HTTP SSE: Connection failed with status {}", response.status());
+                        warn!(
+                            "HTTP SSE: Connection failed with status {}",
+                            response.status()
+                        );
                         tokio::time::sleep(std::time::Duration::from_millis(retry_ms)).await;
                         continue;
                     }
@@ -161,7 +170,12 @@ impl HttpClientTransport {
                                         buffer = buffer[pos + 2..].to_string();
 
                                         if let Some(data) = Self::parse_sse_event(&event_block) {
-                                            Self::handle_sse_message(&data, &pending, &notification_tx).await;
+                                            Self::handle_sse_message(
+                                                &data,
+                                                &pending,
+                                                &notification_tx,
+                                            )
+                                            .await;
                                         }
                                     }
                                 }
@@ -236,7 +250,12 @@ impl HttpClientTransport {
 
 #[async_trait]
 impl Transport for HttpClientTransport {
-    async fn send(&self, _id: Option<Value>, method: &str, params: Option<Value>) -> anyhow::Result<JsonRpcResponse> {
+    async fn send(
+        &self,
+        _id: Option<Value>,
+        method: &str,
+        params: Option<Value>,
+    ) -> anyhow::Result<JsonRpcResponse> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let id_str = id.to_string();
 
@@ -248,7 +267,8 @@ impl Transport for HttpClientTransport {
             "params": params
         });
 
-        let mut builder = self.client
+        let mut builder = self
+            .client
             .post(&self.config.endpoint)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
@@ -267,9 +287,10 @@ impl Transport for HttpClientTransport {
             builder = builder.header(k, v);
         }
 
-        let response = builder.send().await.map_err(|e| {
-            anyhow::anyhow!("HTTP request failed: {}", e)
-        })?;
+        let response = builder
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
 
         // 提取会话 ID（如果有）
         if let Some(session_id) = response.headers().get("MCP-Session-Id") {
@@ -295,20 +316,18 @@ impl Transport for HttpClientTransport {
 
             // 等待 SSE 事件
             let timeout_ms = self.config.timeout_ms;
-            let response = tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_ms),
-                rx,
-            )
-            .await
-            .map_err(|_| anyhow::anyhow!("SSE response timeout"))?
-            .map_err(|_| anyhow::anyhow!("Response channel closed"))?;
+            let response = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), rx)
+                .await
+                .map_err(|_| anyhow::anyhow!("SSE response timeout"))?
+                .map_err(|_| anyhow::anyhow!("Response channel closed"))?;
 
             Ok(response)
         } else {
             // JSON 响应
-            let response: JsonRpcResponse = response.json().await.map_err(|e| {
-                anyhow::anyhow!("Failed to parse JSON response: {}", e)
-            })?;
+            let response: JsonRpcResponse = response
+                .json()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to parse JSON response: {}", e))?;
 
             Ok(response)
         }
@@ -321,7 +340,8 @@ impl Transport for HttpClientTransport {
             "params": params
         });
 
-        let mut builder = self.client
+        let mut builder = self
+            .client
             .post(&self.config.endpoint)
             .header("Content-Type", "application/json")
             .header("MCP-Protocol-Version", MCP_PROTOCOL_VERSION)
@@ -345,7 +365,8 @@ impl Transport for HttpClientTransport {
     async fn close(&self) -> anyhow::Result<()> {
         // 发送 DELETE 请求终止会话
         if let Some(session_id) = self.session_id().await {
-            let builder = self.client
+            let builder = self
+                .client
                 .delete(&self.config.endpoint)
                 .header("MCP-Session-Id", session_id);
 

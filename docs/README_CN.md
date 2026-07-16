@@ -273,11 +273,15 @@ Agent Browser 实现了 [MCP 2025-11-25](https://modelcontextprotocol.io/specifi
 ### 环境变量（HTTP 服务端）
 
 ```bash
+BROWSER_HTTP_HOST=127.0.0.1   # 监听地址（默认仅本机回环）
 BROWSER_HTTP_PORT=8080         # 服务端口（默认：3000）
 BROWSER_HEADLESS=1             # 启用无头模式
 BROWSER_API_KEY=secret123      # API 密钥认证
 BROWSER_DEFAULT_TIMEOUT_MS=60000  # 默认超时时间（毫秒）
+BROWSER_ALLOWED_FILE_ROOTS=/tmp:/path/to/workspace  # 上传/下载允许目录
 ```
+
+监听非回环地址时必须配置 `BROWSER_API_KEY`。
 
 ### Rust 配置
 
@@ -311,7 +315,7 @@ let config = BrowserConfig::default()
 ┌─────────────────────────────────────────────────────────────────┐
 │                   agent-browser-mcp（MCP 服务端）                 │
 │  Tools (30+) | Resources | Prompts | Logging                    │
-│  协议: 2025-11-25 | 传输: stdio, sse, http                       │
+│  协议: 2025-11-25 | 传输: stdio                                  │
 └────────────────────────────┬────────────────────────────────────┘
                              │ 复用
                              ▼

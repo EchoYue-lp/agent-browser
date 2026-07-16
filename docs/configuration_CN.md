@@ -80,10 +80,12 @@ let config = BrowserConfig::headless_old();
 
 | 变量 | 描述 | 默认值 |
 |------|------|--------|
+| `BROWSER_HTTP_HOST` | 监听地址；非回环地址必须配置 API Key | `127.0.0.1` |
 | `BROWSER_HTTP_PORT` | 服务器端口 | `3000` |
-| `BROWSER_HEADLESS` | 启用无头模式（任意值） | - |
+| `BROWSER_HEADLESS` | `false` 为有头，`old` 为旧无头，其他值为新无头 | 新无头 |
 | `BROWSER_API_KEY` | API 认证密钥 | - |
 | `BROWSER_DEFAULT_TIMEOUT_MS` | 默认超时时间（毫秒） | `30000` |
+| `BROWSER_ALLOWED_FILE_ROOTS` | 按平台路径分隔符连接的上传/下载允许目录 | 当前目录和临时目录 |
 
 ### 示例
 
@@ -92,6 +94,7 @@ let config = BrowserConfig::headless_old();
 BROWSER_HTTP_PORT=8080 \
 BROWSER_HEADLESS=1 \
 BROWSER_API_KEY=secret123 \
+BROWSER_ALLOWED_FILE_ROOTS=/tmp:/path/to/workspace \
 BROWSER_DEFAULT_TIMEOUT_MS=60000 \
 ./target/release/agent-browser-http
 ```

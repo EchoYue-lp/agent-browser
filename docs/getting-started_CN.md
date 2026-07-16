@@ -130,7 +130,7 @@ use agent_browser_core::{BrowserEngine, BrowserConfig};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 创建浏览器引擎（有头模式显示浏览器窗口）
-    let engine = BrowserEngine::new(BrowserConfig::headed())?;
+    let engine = BrowserEngine::new(BrowserConfig::headed());
 
     // 导航到页面
     engine.navigate("https://example.com").await?;
@@ -150,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
     engine.type_selector("input[name='email']", "hello@example.com", true, None).await?;
 
     // 截图
-    let screenshot = engine.screenshot(None).await?;
+    let screenshot = engine.screenshot().await?;
 
     // 关闭
     engine.shutdown().await?;
@@ -169,7 +169,7 @@ let config = BrowserConfig::default()
     .with_headless(HeadlessMode::New)  // Chrome 112+ 无头模式，难以检测
     .with_stealth(true);                // 注入反检测脚本
 
-let engine = BrowserEngine::new(config)?;
+let engine = BrowserEngine::new(config);
 ```
 
 #### 自定义配置
@@ -184,7 +184,7 @@ let config = BrowserConfig::default()
     .with_stealth(true)
     .with_arg("--disable-web-security");
 
-let engine = BrowserEngine::new(config)?;
+let engine = BrowserEngine::new(config);
 ```
 
 ## 环境变量
@@ -193,10 +193,12 @@ let engine = BrowserEngine::new(config)?;
 
 | 变量 | 描述 | 默认值 |
 |------|------|--------|
+| `BROWSER_HTTP_HOST` | 监听地址 | `127.0.0.1` |
 | `BROWSER_HTTP_PORT` | 服务器端口 | `3000` |
-| `BROWSER_HEADLESS` | 启用无头模式 | `false` |
+| `BROWSER_HEADLESS` | 浏览器显示模式 | 新无头 |
 | `BROWSER_API_KEY` | API 认证密钥 | - |
 | `BROWSER_DEFAULT_TIMEOUT_MS` | 默认超时时间（毫秒） | `30000` |
+| `BROWSER_ALLOWED_FILE_ROOTS` | 上传/下载允许目录 | 当前目录和临时目录 |
 
 ## 下一步
 

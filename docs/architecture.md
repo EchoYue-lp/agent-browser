@@ -16,7 +16,7 @@ Agent Browser is designed as a modular system with clear separation of concerns:
 ┌─────────────────────────────────────────────────────────────────┐
 │                   agent-browser-mcp (MCP Server)                 │
 │  Tools (30+) | Resources | Prompts | Logging                    │
-│  Protocol: 2025-11-25 | Transports: stdio, sse, http            │
+│  Protocol: 2025-11-25 | Transport: stdio                        │
 └────────────────────────────┬────────────────────────────────────┘
                              │ Reuses
                              ▼

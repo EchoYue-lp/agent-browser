@@ -135,11 +135,135 @@ pub async fn dispatch_action(
         }
         Err(e) => {
             warn!("Action {:?} failed: {}", action, e);
-            Ok(ActionResult {
-                success: false,
-                message: e.to_string(),
-            })
+            Err(e)
         }
+    }
+}
+
+/// Dispatch an action inside a specific CDP execution context.
+pub async fn dispatch_action_in_context(
+    page: &Page,
+    context_id: i64,
+    ref_id: &str,
+    action: ActionKind,
+    snapshot_url: Option<&str>,
+) -> Result<ActionResult> {
+    use chromiumoxide::cdp::js_protocol::runtime::{EvaluateParams, ExecutionContextId};
+
+    if let Some(expected_url) = snapshot_url {
+        let current = page.url().await.ok().flatten().unwrap_or_default();
+        if current != expected_url {
+            return Err(Error::PageChanged {
+                expected: expected_url.to_string(),
+                current,
+            });
+        }
+    }
+
+    if let ActionKind::Wait { timeout_ms } = action {
+        let ms = timeout_ms.unwrap_or(1000);
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        return Ok(ActionResult {
+            success: true,
+            message: format!("Waited {ms}ms"),
+        });
+    }
+
+    let selector = format!("[data-agent-ref=\"{ref_id}\"]");
+    let selector_json = serde_json::to_string(&selector)?;
+    let script = match action {
+        ActionKind::Click => format!(
+            "(() => {{ const el = document.querySelector({selector_json}); if (!el) return {{ok:false,error:'Element not found'}}; el.click(); return {{ok:true,message:'Clicked'}}; }})()"
+        ),
+        ActionKind::DoubleClick => format!(
+            "(() => {{ const el = document.querySelector({selector_json}); if (!el) return {{ok:false,error:'Element not found'}}; el.dispatchEvent(new MouseEvent('dblclick', {{bubbles:true,cancelable:true,view:window}})); return {{ok:true,message:'Double-clicked'}}; }})()"
+        ),
+        ActionKind::RightClick => format!(
+            "(() => {{ const el = document.querySelector({selector_json}); if (!el) return {{ok:false,error:'Element not found'}}; el.dispatchEvent(new MouseEvent('contextmenu', {{bubbles:true,cancelable:true,button:2}})); return {{ok:true,message:'Right-clicked'}}; }})()"
+        ),
+        ActionKind::Hover => format!(
+            "(() => {{ const el = document.querySelector({selector_json}); if (!el) return {{ok:false,error:'Element not found'}}; el.dispatchEvent(new MouseEvent('mouseover', {{bubbles:true,cancelable:true,view:window}})); el.dispatchEvent(new MouseEvent('mouseenter', {{bubbles:false,cancelable:true,view:window}})); return {{ok:true,message:'Hovered'}}; }})()"
+        ),
+        ActionKind::Focus => format!(
+            "(() => {{ const el = document.querySelector({selector_json}); if (!el) return {{ok:false,error:'Element not found'}}; el.focus(); return {{ok:true,message:'Focused'}}; }})()"
+        ),
+        ActionKind::Type { text, clear_first } => {
+            let text_json = serde_json::to_string(&text)?;
+            format!(
+                "(() => {{ const el = document.querySelector({selector_json}); if (!el) return {{ok:false,error:'Element not found'}}; el.focus(); if ({clear}) el.value = ''; el.value += {text_json}; el.dispatchEvent(new Event('input', {{bubbles:true}})); el.dispatchEvent(new Event('change', {{bubbles:true}})); return {{ok:true,message:'Typed text'}}; }})()",
+                clear = clear_first.unwrap_or(false)
+            )
+        }
+        ActionKind::Press { key } => {
+            let key_json = serde_json::to_string(&key)?;
+            format!(
+                "(() => {{ const el = document.querySelector({selector_json}); if (!el) return {{ok:false,error:'Element not found'}}; el.focus(); el.dispatchEvent(new KeyboardEvent('keydown', {{key:{key_json},bubbles:true}})); el.dispatchEvent(new KeyboardEvent('keyup', {{key:{key_json},bubbles:true}})); return {{ok:true,message:'Pressed key'}}; }})()"
+            )
+        }
+        ActionKind::Select { values } => {
+            let values_json = serde_json::to_string(&values)?;
+            format!(
+                "(() => {{ const el = document.querySelector({selector_json}); if (!el) return {{ok:false,error:'Element not found'}}; if (!el.options) return {{ok:false,error:'Element is not a select'}}; const values = {values_json}; for (const option of el.options) option.selected = values.includes(option.value); el.dispatchEvent(new Event('change', {{bubbles:true}})); return {{ok:true,message:'Selected options'}}; }})()"
+            )
+        }
+        ActionKind::Scroll { direction, amount } => {
+            let amount = amount.unwrap_or(300);
+            let (dx, dy) = match direction.as_deref().unwrap_or("down") {
+                "up" => (0, -amount),
+                "down" => (0, amount),
+                "left" => (-amount, 0),
+                "right" => (amount, 0),
+                invalid => {
+                    return Err(Error::InvalidParameter(format!(
+                        "Invalid scroll direction: {invalid}"
+                    )));
+                }
+            };
+            format!(
+                "(() => {{ window.scrollBy({dx},{dy}); return {{ok:true,message:'Scrolled'}}; }})()"
+            )
+        }
+        ActionKind::Drag { target_ref_id } => {
+            let target = format!("[data-agent-ref=\"{target_ref_id}\"]");
+            let target_json = serde_json::to_string(&target)?;
+            format!(
+                "(() => {{ const src = document.querySelector({selector_json}); const target = document.querySelector({target_json}); if (!src || !target) return {{ok:false,error:'Drag source or target not found'}}; const data = new DataTransfer(); src.dispatchEvent(new DragEvent('dragstart', {{bubbles:true,dataTransfer:data}})); target.dispatchEvent(new DragEvent('dragover', {{bubbles:true,dataTransfer:data}})); target.dispatchEvent(new DragEvent('drop', {{bubbles:true,dataTransfer:data}})); src.dispatchEvent(new DragEvent('dragend', {{bubbles:true,dataTransfer:data}})); return {{ok:true,message:'Dragged'}}; }})()"
+            )
+        }
+        ActionKind::Wait { .. } => {
+            return Err(Error::Other("Wait action was not handled".to_string()));
+        }
+    };
+
+    let params = EvaluateParams::builder()
+        .expression(script)
+        .context_id(ExecutionContextId::new(context_id))
+        .await_promise(true)
+        .return_by_value(true)
+        .build()
+        .map_err(Error::InvalidParameter)?;
+    let result: serde_json::Value = page
+        .evaluate_expression(params)
+        .await
+        .map_err(|e| Error::JavaScript(e.to_string()))?
+        .into_value()
+        .map_err(|e| Error::JavaScript(e.to_string()))?;
+
+    if result["ok"].as_bool().unwrap_or(false) {
+        Ok(ActionResult {
+            success: true,
+            message: result["message"]
+                .as_str()
+                .unwrap_or("Action completed")
+                .to_string(),
+        })
+    } else {
+        Err(Error::ElementNotFound(
+            result["error"]
+                .as_str()
+                .unwrap_or("Element action failed")
+                .to_string(),
+        ))
     }
 }
 
@@ -387,10 +511,7 @@ async fn dispatch_drag(
         })
     } else {
         let err = result["error"].as_str().unwrap_or("unknown").to_string();
-        Ok(ActionResult {
-            success: false,
-            message: format!("Drag failed: {}", err),
-        })
+        Err(Error::ElementNotFound(format!("Drag failed: {err}")))
     }
 }
 

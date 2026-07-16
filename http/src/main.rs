@@ -48,14 +48,14 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tower_http::cors::{Any, CorsLayer};
 use tracing::info;
 
 use agent_browser_core::{
-    BrowserConfig, BrowserEngine, HeadlessMode, ScreenshotOptions, SetCookieParam, SnapshotNode,
-    TabInfo, actions::ActionResult,
+    BrowserConfig, BrowserEngine, HeadlessMode, NavigationWaitUntil, ScreenshotOptions,
+    SetCookieParam, SnapshotNode, TabInfo, actions::ActionResult,
 };
 
 // ---------------------------------------------------------------------------
@@ -75,6 +75,8 @@ pub struct AppState {
 /// HTTP server configuration
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
+    /// Address to bind. Defaults to loopback for safety.
+    pub host: IpAddr,
     /// Server port
     pub port: u16,
     /// API key for authentication (optional)
@@ -88,6 +90,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             port: 3000,
             api_key: None,
             default_timeout_ms: 30_000,
@@ -141,6 +144,36 @@ fn ok_empty() -> ApiSuccess<serde_json::Value> {
         status: "ok",
         data: None,
     }
+}
+
+fn emit_event(state: &AppState, event_type: &str, data: serde_json::Value) {
+    let _ = state.event_tx.send(serde_json::json!({
+        "type": event_type,
+        "data": data,
+    }));
+}
+
+fn parse_wait_until(value: Option<&str>) -> Result<NavigationWaitUntil, String> {
+    match value {
+        None | Some("load") => Ok(NavigationWaitUntil::Load),
+        Some("domContentLoaded" | "dom_content_loaded" | "DOMContentLoaded") => {
+            Ok(NavigationWaitUntil::DomContentLoaded)
+        }
+        Some("networkIdle" | "networkidle" | "network_idle") => {
+            Ok(NavigationWaitUntil::NetworkIdle)
+        }
+        Some("none") => Ok(NavigationWaitUntil::None),
+        Some(other) => Err(format!("Unsupported wait_until value: {other}")),
+    }
+}
+
+fn validate_server_config(config: &HttpConfig) -> anyhow::Result<()> {
+    if !config.host.is_loopback() && config.api_key.is_none() {
+        anyhow::bail!(
+            "BROWSER_API_KEY is required when binding the HTTP server to a non-loopback address"
+        );
+    }
+    Ok(())
 }
 
 impl<T: Serialize> IntoResponse for ApiSuccess<T> {
@@ -343,11 +376,16 @@ async fn auth_middleware(
     next: Next,
 ) -> Response {
     if let Some(ref required_key) = state.config.api_key {
-        let provided = request
+        let x_api_key = request
             .headers()
             .get("X-API-Key")
             .and_then(|v| v.to_str().ok());
-        if provided != Some(required_key.as_str()) {
+        let bearer = request
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        if x_api_key != Some(required_key.as_str()) && bearer != Some(required_key.as_str()) {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(ApiError {
@@ -374,22 +412,35 @@ pub async fn navigate(
 
     let engine = &state.engine;
 
-    let result = engine.navigate(&req.url).await.map_err(|e| {
+    let wait_until = parse_wait_until(req.wait_until.as_deref()).map_err(|error| {
         (
-            StatusCode::BAD_GATEWAY,
-            Json(ApiError::new("navigation_failed", e)),
+            StatusCode::BAD_REQUEST,
+            Json(ApiError::new("invalid_wait_until", error)),
         )
     })?;
 
-    // Apply wait_until
-    if let Some(ref wait) = req.wait_until
-        && wait.as_str() == "networkidle"
-    {
-        let _ = engine.wait_for_network_idle(500, 30_000).await;
-    }
+    let result = engine
+        .navigate_with_options(&req.url, wait_until)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiError::new("navigation_failed", e)),
+            )
+        })?;
+
+    emit_event(
+        &state,
+        "navigation",
+        serde_json::json!({
+            "url": &result.final_url,
+            "title": &result.title,
+            "wait_until": &req.wait_until,
+        }),
+    );
 
     Ok(Json(ok(NavigateResponse {
-        url: req.url,
+        url: result.final_url,
         title: result.title,
     })))
 }
@@ -498,6 +549,11 @@ pub async fn act(
                     Json(ApiError::new("wait_failed", e)),
                 )
             })?;
+            emit_event(
+                &state,
+                "action",
+                serde_json::json!({"action": "wait", "timeout_ms": timeout}),
+            );
             return Ok(Json(ok(ActionResult {
                 success: true,
                 message: format!("Waited {}ms", timeout),
@@ -514,13 +570,22 @@ pub async fn act(
         }
     };
 
-    match result {
-        Ok(action_result) => Ok(Json(ok(action_result))),
-        Err(e) => Ok(Json(ok(ActionResult {
-            success: false,
-            message: e.to_string(),
-        }))),
-    }
+    let action_result = result.map_err(|e| {
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiError::new("action_failed", e)),
+        )
+    })?;
+    emit_event(
+        &state,
+        "action",
+        serde_json::json!({
+            "action": req.action,
+            "ref_id": req.ref_id,
+            "success": action_result.success,
+        }),
+    );
+    Ok(Json(ok(action_result)))
 }
 
 /// GET /screenshot
@@ -712,6 +777,12 @@ pub async fn upload(
             )
         })?;
 
+    emit_event(
+        &state,
+        "upload",
+        serde_json::json!({"file": &req.file_path, "ref_id": &req.ref_id}),
+    );
+
     Ok(Json(ok(serde_json::json!({ "file": req.file_path }))))
 }
 
@@ -748,6 +819,8 @@ pub async fn shutdown(
         )
     })?;
 
+    emit_event(&state, "shutdown", serde_json::json!({}));
+
     Ok(Json(ok_empty()))
 }
 
@@ -774,6 +847,12 @@ pub async fn enter_iframe(
         )
     })?;
 
+    emit_event(
+        &state,
+        "iframe_entered",
+        serde_json::json!({"depth": depth, "ref_id": &req.ref_id}),
+    );
+
     Ok(Json(ok(
         serde_json::json!({ "depth": depth, "ref_id": req.ref_id }),
     )))
@@ -792,6 +871,8 @@ pub async fn exit_iframe(
         )
     })?;
 
+    emit_event(&state, "iframe_exited", serde_json::json!({"depth": depth}));
+
     Ok(Json(ok(serde_json::json!({ "depth": depth }))))
 }
 
@@ -807,6 +888,8 @@ pub async fn exit_all_iframes(
             Json(ApiError::new("exit_all_iframes_failed", e)),
         )
     })?;
+
+    emit_event(&state, "iframe_exited_all", serde_json::json!({"depth": 0}));
 
     Ok(Json(ok(serde_json::json!({ "depth": 0 }))))
 }
@@ -855,6 +938,17 @@ pub async fn download_file(
             )
         })?;
 
+    emit_event(
+        &state,
+        "download",
+        serde_json::json!({
+            "guid": &result.guid,
+            "filename": &result.filename,
+            "file_path": &result.file_path,
+            "size": result.size,
+        }),
+    );
+
     Ok(Json(ok(serde_json::json!({
         "guid": result.guid,
         "filename": result.filename,
@@ -885,6 +979,17 @@ pub async fn click_and_download(
                 Json(ApiError::new("download_failed", e)),
             )
         })?;
+
+    emit_event(
+        &state,
+        "download",
+        serde_json::json!({
+            "guid": &result.guid,
+            "filename": &result.filename,
+            "file_path": &result.file_path,
+            "size": result.size,
+        }),
+    );
 
     Ok(Json(ok(serde_json::json!({
         "guid": result.guid,
@@ -1166,10 +1271,22 @@ pub async fn expand_and_click_submenu(
 }
 
 /// GET /health
-pub async fn health() -> Json<ApiSuccess<serde_json::Value>> {
-    Json(ok(
-        serde_json::json!({ "version": env!("CARGO_PKG_VERSION"), "status": "ok" }),
-    ))
+pub async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let launched = state.engine.is_launched().await;
+    let responsive = !launched || state.engine.health_check().await;
+    let status = if responsive {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(ok(serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "status": if !responsive { "unhealthy" } else if launched { "ready" } else { "idle" },
+            "browser_running": launched && responsive,
+        }))),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1279,12 +1396,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             state.clone(),
             auth_middleware,
         ))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
         .with_state(state)
 }
 
@@ -1293,6 +1404,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 // ---------------------------------------------------------------------------
 
 pub async fn run_server(config: HttpConfig) -> anyhow::Result<()> {
+    validate_server_config(&config)?;
+
     // Initialize browser engine
     let engine = BrowserEngine::new(config.browser.clone());
 
@@ -1311,7 +1424,7 @@ pub async fn run_server(config: HttpConfig) -> anyhow::Result<()> {
     let app = build_router(state);
 
     // Start server
-    let addr = format!("0.0.0.0:{}", config.port);
+    let addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("HTTP server listening on http://{}", addr);
     axum::serve(listener, app).await?;
@@ -1323,11 +1436,19 @@ pub async fn run_server(config: HttpConfig) -> anyhow::Result<()> {
 pub fn config_from_env() -> HttpConfig {
     let mut config = HttpConfig::default();
 
+    if let Ok(host) = std::env::var("BROWSER_HTTP_HOST") {
+        if let Ok(host) = host.parse() {
+            config.host = host;
+        }
+    }
+
     if let Ok(port) = std::env::var("BROWSER_HTTP_PORT") {
         config.port = port.parse().unwrap_or(3000);
     }
 
-    if let Ok(api_key) = std::env::var("BROWSER_API_KEY") {
+    if let Ok(api_key) = std::env::var("BROWSER_API_KEY")
+        && !api_key.is_empty()
+    {
         config.api_key = Some(api_key);
     }
 
@@ -1335,8 +1456,16 @@ pub fn config_from_env() -> HttpConfig {
         config.default_timeout_ms = timeout.parse().unwrap_or(30_000);
     }
 
-    if std::env::var("BROWSER_HEADLESS").is_ok() {
-        config.browser.headless = HeadlessMode::New;
+    if let Ok(headless) = std::env::var("BROWSER_HEADLESS") {
+        config.browser.headless = match headless.to_ascii_lowercase().as_str() {
+            "0" | "false" | "no" => HeadlessMode::None,
+            "old" => HeadlessMode::Old,
+            _ => HeadlessMode::New,
+        };
+    }
+
+    if let Some(roots) = std::env::var_os("BROWSER_ALLOWED_FILE_ROOTS") {
+        config.browser.allowed_file_roots = std::env::split_paths(&roots).collect();
     }
 
     config
@@ -1351,4 +1480,45 @@ fn main() -> anyhow::Result<()> {
 
     // Run server
     tokio::runtime::Runtime::new()?.block_on(run_server(config))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_defaults_to_loopback() {
+        let config = HttpConfig::default();
+        assert!(config.host.is_loopback());
+        assert!(validate_server_config(&config).is_ok());
+    }
+
+    #[test]
+    fn non_loopback_requires_api_key() {
+        let mut config = HttpConfig {
+            host: "0.0.0.0".parse().unwrap(),
+            ..HttpConfig::default()
+        };
+        assert!(validate_server_config(&config).is_err());
+        config.api_key = Some("secret".to_string());
+        assert!(validate_server_config(&config).is_ok());
+    }
+
+    #[test]
+    fn parses_navigation_wait_strategies() {
+        assert_eq!(parse_wait_until(None).unwrap(), NavigationWaitUntil::Load);
+        assert_eq!(
+            parse_wait_until(Some("domContentLoaded")).unwrap(),
+            NavigationWaitUntil::DomContentLoaded
+        );
+        assert_eq!(
+            parse_wait_until(Some("networkidle")).unwrap(),
+            NavigationWaitUntil::NetworkIdle
+        );
+        assert_eq!(
+            parse_wait_until(Some("none")).unwrap(),
+            NavigationWaitUntil::None
+        );
+        assert!(parse_wait_until(Some("networkidle0")).is_err());
+    }
 }

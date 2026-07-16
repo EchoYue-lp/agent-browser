@@ -8,14 +8,17 @@ use crate::protocol::{Tool, ToolAnnotations};
 
 /// 获取所有工具定义
 pub fn get_tool_definitions() -> Vec<Tool> {
-    TOOLS.iter().map(|def| Tool {
-        name: def.name.to_string(),
-        title: def.title.map(|s| s.to_string()),
-        description: Some(def.description.to_string()),
-        input_schema: (def.input_schema)(),
-        output_schema: None,
-        annotations: Some(def.annotations.clone()),
-    }).collect()
+    TOOLS
+        .iter()
+        .map(|def| Tool {
+            name: def.name.to_string(),
+            title: def.title.map(|s| s.to_string()),
+            description: Some(def.description.to_string()),
+            input_schema: (def.input_schema)(),
+            output_schema: None,
+            annotations: Some(def.annotations.clone()),
+        })
+        .collect()
 }
 
 /// 工具定义
@@ -34,16 +37,18 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_navigate",
         title: Some("Navigate to URL"),
         description: "Open browser and navigate to the specified URL. Returns page info.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "url": {
-                    "type": "string",
-                    "description": "Target URL (must include http:// or https://)"
-                }
-            },
-            "required": ["url"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Target URL (must include http:// or https://)"
+                    }
+                },
+                "required": ["url"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -69,16 +74,18 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_click",
         title: Some("Click Element"),
         description: "Click an element on the page. Requires ref_id from browser_snapshot.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "ref_id": {
-                    "type": "string",
-                    "description": "Element reference ID (e.g., 'ax1', 'e5')"
-                }
-            },
-            "required": ["ref_id"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref_id": {
+                        "type": "string",
+                        "description": "Element reference ID (e.g., 'ax1', 'e5')"
+                    }
+                },
+                "required": ["ref_id"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -91,15 +98,17 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_type",
         title: Some("Type Text"),
         description: "Type text into an input field. Requires ref_id from browser_snapshot.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "ref_id": { "type": "string", "description": "Element reference ID" },
-                "text": { "type": "string", "description": "Text to type" },
-                "clear_first": { "type": "boolean", "description": "Clear field first (default: false)" }
-            },
-            "required": ["ref_id", "text"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref_id": { "type": "string", "description": "Element reference ID" },
+                    "text": { "type": "string", "description": "Text to type" },
+                    "clear_first": { "type": "boolean", "description": "Clear field first (default: false)" }
+                },
+                "required": ["ref_id", "text"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -112,14 +121,16 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_press",
         title: Some("Press Key"),
         description: "Press a key on an element (e.g., Enter, Tab, Escape).",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "ref_id": { "type": "string", "description": "Element reference ID" },
-                "key": { "type": "string", "description": "Key name (e.g., 'Enter', 'Tab', 'Escape', 'ArrowDown')" }
-            },
-            "required": ["ref_id", "key"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref_id": { "type": "string", "description": "Element reference ID" },
+                    "key": { "type": "string", "description": "Key name (e.g., 'Enter', 'Tab', 'Escape', 'ArrowDown')" }
+                },
+                "required": ["ref_id", "key"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -132,13 +143,15 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_scroll",
         title: Some("Scroll Page"),
         description: "Scroll the page in a direction.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "direction": { "type": "string", "enum": ["up", "down", "left", "right"], "description": "Direction (default: down)" },
-                "amount": { "type": "integer", "description": "Pixels to scroll (default: 300)" }
-            }
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "direction": { "type": "string", "enum": ["up", "down", "left", "right"], "description": "Direction (default: down)" },
+                    "amount": { "type": "integer", "description": "Pixels to scroll (default: 300)" }
+                }
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -151,13 +164,15 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_screenshot",
         title: Some("Take Screenshot"),
         description: "Take a screenshot of the current page. Supports full page and element screenshots.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "full_page": { "type": "boolean", "description": "Capture full page (default: false)" },
-                "selector": { "type": "string", "description": "CSS selector to capture specific element" }
-            }
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "full_page": { "type": "boolean", "description": "Capture full page (default: false)" },
+                    "selector": { "type": "string", "description": "CSS selector to capture specific element" }
+                }
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(true),
             destructive_hint: Some(false),
@@ -170,13 +185,15 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_wait",
         title: Some("Wait"),
         description: "Wait for a specified time or for a selector to appear.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default: 1000)" },
-                "selector": { "type": "string", "description": "CSS selector to wait for" }
-            }
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "timeout_ms": { "type": "integer", "description": "Timeout in milliseconds (default: 1000)" },
+                    "selector": { "type": "string", "description": "CSS selector to wait for" }
+                }
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(true),
             destructive_hint: Some(false),
@@ -189,13 +206,15 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_evaluate",
         title: Some("Execute JavaScript"),
         description: "Execute JavaScript code on the page.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "script": { "type": "string", "description": "JavaScript code" }
-            },
-            "required": ["script"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "script": { "type": "string", "description": "JavaScript code" }
+                },
+                "required": ["script"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -220,25 +239,27 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_set_cookies",
         title: Some("Set Cookies"),
         description: "Set cookies for the current page.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "cookies": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": { "type": "string" },
-                            "value": { "type": "string" },
-                            "domain": { "type": "string" },
-                            "path": { "type": "string" }
-                        },
-                        "required": ["name", "value"]
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "cookies": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "value": { "type": "string" },
+                                "domain": { "type": "string" },
+                                "path": { "type": "string" }
+                            },
+                            "required": ["name", "value"]
+                        }
                     }
-                }
-            },
-            "required": ["cookies"]
-        }),
+                },
+                "required": ["cookies"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -263,13 +284,15 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_activate_tab",
         title: Some("Activate Tab"),
         description: "Switch to a specific tab.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "tab_id": { "type": "string", "description": "Tab ID to activate" }
-            },
-            "required": ["tab_id"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string", "description": "Tab ID to activate" }
+                },
+                "required": ["tab_id"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -281,13 +304,15 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_close_tab",
         title: Some("Close Tab"),
         description: "Close a specific tab.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "tab_id": { "type": "string", "description": "Tab ID to close" }
-            },
-            "required": ["tab_id"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "tab_id": { "type": "string", "description": "Tab ID to close" }
+                },
+                "required": ["tab_id"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(true),
@@ -300,14 +325,16 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_upload",
         title: Some("Upload File"),
         description: "Upload a file to a file input element.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "ref_id": { "type": "string", "description": "File input element reference ID" },
-                "file_path": { "type": "string", "description": "Absolute path to local file" }
-            },
-            "required": ["ref_id", "file_path"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref_id": { "type": "string", "description": "File input element reference ID" },
+                    "file_path": { "type": "string", "description": "Absolute path to local file" }
+                },
+                "required": ["ref_id", "file_path"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -320,13 +347,15 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_wait_for_network_idle",
         title: Some("Wait for Network Idle"),
         description: "Wait for network requests to complete (use after SPA page load).",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "idle_ms": { "type": "integer", "description": "Idle threshold in ms (default: 500)" },
-                "timeout_ms": { "type": "integer", "description": "Max wait time in ms (default: 30000)" }
-            }
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "idle_ms": { "type": "integer", "description": "Idle threshold in ms (default: 500)" },
+                    "timeout_ms": { "type": "integer", "description": "Max wait time in ms (default: 30000)" }
+                }
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(true),
             destructive_hint: Some(false),
@@ -352,13 +381,15 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_enter_iframe",
         title: Some("Enter Iframe"),
         description: "Enter an iframe context. Subsequent operations will execute inside the iframe.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "ref_id": { "type": "string", "description": "Iframe element reference ID" }
-            },
-            "required": ["ref_id"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref_id": { "type": "string", "description": "Iframe element reference ID" }
+                },
+                "required": ["ref_id"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -395,15 +426,17 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_download_file",
         title: Some("Download File"),
         description: "Download a file from URL.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "url": { "type": "string", "description": "URL of file to download" },
-                "save_path": { "type": "string", "description": "Save directory (optional)" },
-                "timeout_ms": { "type": "integer", "description": "Download timeout (default: 60000)" }
-            },
-            "required": ["url"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "URL of file to download" },
+                    "save_path": { "type": "string", "description": "Save directory (optional)" },
+                    "timeout_ms": { "type": "integer", "description": "Download timeout (default: 60000)" }
+                },
+                "required": ["url"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -415,15 +448,17 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_click_and_download",
         title: Some("Click and Download"),
         description: "Click an element and wait for download to complete.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "ref_id": { "type": "string", "description": "Element to click" },
-                "save_path": { "type": "string", "description": "Save directory (optional)" },
-                "timeout_ms": { "type": "integer", "description": "Download timeout (default: 60000)" }
-            },
-            "required": ["ref_id"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "ref_id": { "type": "string", "description": "Element to click" },
+                    "save_path": { "type": "string", "description": "Save directory (optional)" },
+                    "timeout_ms": { "type": "integer", "description": "Download timeout (default: 60000)" }
+                },
+                "required": ["ref_id"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -436,18 +471,20 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_press_key",
         title: Some("Press Key with Modifiers"),
         description: "Press a key with optional modifiers (Ctrl, Alt, Shift, Cmd).",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "key": { "type": "string", "description": "Key (e.g., 'c', 'Enter', 'F5')" },
-                "modifiers": {
-                    "type": "array",
-                    "items": { "type": "string", "enum": ["alt", "control", "meta", "shift"] },
-                    "description": "Modifier keys"
-                }
-            },
-            "required": ["key"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Key (e.g., 'c', 'Enter', 'F5')" },
+                    "modifiers": {
+                        "type": "array",
+                        "items": { "type": "string", "enum": ["alt", "control", "meta", "shift"] },
+                        "description": "Modifier keys"
+                    }
+                },
+                "required": ["key"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -459,13 +496,15 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_shortcut",
         title: Some("Send Shortcut"),
         description: "Send a predefined keyboard shortcut (copy, paste, save, undo, etc.).",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "shortcut": { "type": "string", "description": "Shortcut name (copy, paste, cut, save, selectAll, undo, redo, find, refresh, devTools, print, newTab, closeTab)" }
-            },
-            "required": ["shortcut"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "shortcut": { "type": "string", "description": "Shortcut name (copy, paste, cut, save, selectAll, undo, redo, find, refresh, devTools, print, newTab, closeTab)" }
+                },
+                "required": ["shortcut"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -478,14 +517,16 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_navigate_with_options",
         title: Some("Navigate with Options"),
         description: "Navigate with custom wait strategy (load, domContentLoaded, networkIdle, none).",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "url": { "type": "string", "description": "Target URL" },
-                "wait_until": { "type": "string", "enum": ["load", "domContentLoaded", "networkIdle", "none"], "description": "Wait strategy" }
-            },
-            "required": ["url"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Target URL" },
+                    "wait_until": { "type": "string", "enum": ["load", "domContentLoaded", "networkIdle", "none"], "description": "Wait strategy" }
+                },
+                "required": ["url"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),
@@ -572,15 +613,17 @@ static TOOLS: &[ToolDefinition] = &[
         name: "browser_set_viewport",
         title: Some("Set Viewport"),
         description: "Set browser viewport size for device simulation.",
-        input_schema: || json!({
-            "type": "object",
-            "properties": {
-                "width": { "type": "integer", "description": "Viewport width in pixels" },
-                "height": { "type": "integer", "description": "Viewport height in pixels" },
-                "device_scale_factor": { "type": "number", "description": "Device pixel ratio (optional)" }
-            },
-            "required": ["width", "height"]
-        }),
+        input_schema: || {
+            json!({
+                "type": "object",
+                "properties": {
+                    "width": { "type": "integer", "description": "Viewport width in pixels" },
+                    "height": { "type": "integer", "description": "Viewport height in pixels" },
+                    "device_scale_factor": { "type": "number", "description": "Device pixel ratio (optional)" }
+                },
+                "required": ["width", "height"]
+            })
+        },
         annotations: ToolAnnotations {
             read_only_hint: Some(false),
             destructive_hint: Some(false),

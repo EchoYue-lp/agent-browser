@@ -183,10 +183,10 @@ http://localhost:3000
 
 ### 认证
 
-可选的 API 密钥认证，通过 `Authorization` 头：
+可选的 API 密钥认证，支持 `X-API-Key` 或 Bearer Authorization：
 
 ```bash
-curl -H "Authorization: Bearer YOUR_API_KEY" http://localhost:3000/snapshot
+curl -H "X-API-Key: YOUR_API_KEY" http://localhost:3000/snapshot
 ```
 
 ### 端点
@@ -200,7 +200,7 @@ curl -H "Authorization: Bearer YOUR_API_KEY" http://localhost:3000/snapshot
 ```bash
 curl -X POST http://localhost:3000/navigate \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com", "wait_until": "networkidle0"}'
+  -d '{"url": "https://example.com", "wait_until": "networkIdle"}'
 ```
 
 **响应：**
@@ -609,7 +609,7 @@ ws.onmessage = (event) => {
 use agent_browser_core::{BrowserEngine, BrowserConfig, HeadlessMode};
 
 // 创建引擎
-let engine = BrowserEngine::new(BrowserConfig::default())?;
+let engine = BrowserEngine::new(BrowserConfig::default());
 
 // 启动浏览器
 engine.launch().await?;
@@ -633,7 +633,7 @@ engine.type_selector("input#email", "hello@example.com", true, None).await?;
 let text = engine.get_text(".article-title", None).await?;
 
 // 截图
-let screenshot = engine.screenshot(None).await?;
+let screenshot = engine.screenshot().await?;
 
 // 执行 JavaScript
 let result = engine.evaluate("document.title").await?;

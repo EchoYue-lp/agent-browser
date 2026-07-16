@@ -2,6 +2,8 @@
 //!
 //! 完整实现 MCP 2025-11-25 规范
 
+#![allow(dead_code)]
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -422,10 +424,22 @@ pub struct PromptMessage {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Content {
-    Text { text: String },
-    Image { data: String, #[serde(rename = "mimeType")] mime_type: String },
-    Resource { resource: ResourceLink },
-    Audio { data: String, #[serde(rename = "mimeType")] mime_type: String },
+    Text {
+        text: String,
+    },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    Resource {
+        resource: ResourceLink,
+    },
+    Audio {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
 }
 
 /// 资源链接

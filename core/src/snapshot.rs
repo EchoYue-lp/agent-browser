@@ -371,13 +371,13 @@ async fn process_ax_nodes(
 
 /// 处理 AX 节点并构建树（用于 iframe 内部快照）
 ///
-/// 与 process_ax_nodes 类似，但不尝试注入 data-agent-ref 属性
+/// 与 process_ax_nodes 相同，并将 ref_id 注入对应 frame 的 DOM 节点。
 pub async fn process_ax_nodes_in_frame(
-    _page: &Page,
+    page: &Page,
     ax_nodes: &[chromiumoxide::cdp::browser_protocol::accessibility::AxNode],
     start_counter: u32,
 ) -> Result<(Vec<SnapshotNode>, u32)> {
-    process_ax_nodes_impl(_page, ax_nodes, start_counter, false).await
+    process_ax_nodes_impl(page, ax_nodes, start_counter, true).await
 }
 
 /// AX 节点处理的通用实现
@@ -390,7 +390,7 @@ async fn process_ax_nodes_impl(
     inject_refs: bool,
 ) -> Result<(Vec<SnapshotNode>, u32)> {
     use chromiumoxide::cdp::browser_protocol::dom::{
-        PushNodesByBackendIdsToFrontendParams, SetAttributeValueParams,
+        GetDocumentParams, PushNodesByBackendIdsToFrontendParams, SetAttributeValueParams,
     };
 
     // 为非忽略节点分配 ref_id
@@ -417,6 +417,13 @@ async fn process_ax_nodes_impl(
 
     // 批量注入 data-agent-ref 属性
     if inject_refs && !backend_ids.is_empty() {
+        page.execute(GetDocumentParams {
+            depth: Some(0),
+            pierce: Some(true),
+        })
+        .await
+        .map_err(|e| Error::Cdp(e.to_string()))?;
+
         match page
             .execute(PushNodesByBackendIdsToFrontendParams {
                 backend_node_ids: backend_ids,
@@ -426,13 +433,16 @@ async fn process_ax_nodes_impl(
             Ok(push_result) => {
                 for (node_id, ref_id) in push_result.node_ids.iter().zip(ref_ids_for_backend.iter())
                 {
-                    let _ = page
+                    if let Err(error) = page
                         .execute(SetAttributeValueParams {
                             node_id: *node_id,
                             name: "data-agent-ref".to_string(),
                             value: ref_id.clone(),
                         })
-                        .await;
+                        .await
+                    {
+                        warn!("SetAttributeValue failed for {ref_id}: {error}");
+                    }
                 }
             }
             Err(e) => {
@@ -756,6 +766,8 @@ const GET_AX_TREE_WITH_IFRAMES_JS: &str = r#"
                 if (node) {
                     parent.children.push(node);
                     processChildren(node, child, depth + 1);
+                } else {
+                    processChildren(parent, child, depth + 1);
                 }
             }
         } catch (e) {}
@@ -814,11 +826,18 @@ const GET_AX_TREE_WITH_IFRAMES_JS: &str = r#"
     };
 
     // 处理主文档
-    const root = processElement(body);
-    if (root) {
-        processChildren(root, body, 0);
-        result.nodes.push(root);
-    }
+    const root = processElement(body) || {
+        ref_id: getOrAssignRefId(body),
+        role: 'document',
+        name: document.title || '',
+        value: null,
+        description: null,
+        bounds: getBounds(body),
+        attributes: { tag: 'body' },
+        children: []
+    };
+    processChildren(root, body, 0);
+    result.nodes.push(root);
 
     // 处理所有 iframe
     const iframes = document.querySelectorAll('iframe');

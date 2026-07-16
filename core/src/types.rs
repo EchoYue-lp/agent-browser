@@ -32,12 +32,19 @@ pub struct BrowserConfig {
     pub stealth: bool,
     /// Extra browser launch arguments.
     pub extra_args: Vec<String>,
+    /// Filesystem roots that uploads and downloads may access.
+    pub allowed_file_roots: Vec<PathBuf>,
 }
 
 impl Default for BrowserConfig {
     fn default() -> Self {
         // Auto-detect Chrome path
         let browser_path = Self::detect_chrome_path();
+
+        let mut allowed_file_roots = vec![std::env::temp_dir()];
+        if let Ok(current_dir) = std::env::current_dir() {
+            allowed_file_roots.push(current_dir);
+        }
 
         Self {
             headless: HeadlessMode::New,
@@ -47,6 +54,7 @@ impl Default for BrowserConfig {
             action_timeout_ms: 10_000,
             stealth: true,
             extra_args: Vec::new(),
+            allowed_file_roots,
         }
     }
 }
@@ -103,6 +111,22 @@ impl BrowserConfig {
     /// Add a browser launch argument.
     pub fn with_arg(mut self, arg: impl Into<String>) -> Self {
         self.extra_args.push(arg.into());
+        self
+    }
+
+    /// Add a filesystem root that uploads and downloads may access.
+    pub fn with_allowed_file_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.allowed_file_roots.push(root.into());
+        self
+    }
+
+    /// Replace the filesystem roots that uploads and downloads may access.
+    pub fn with_allowed_file_roots<I, P>(mut self, roots: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.allowed_file_roots = roots.into_iter().map(Into::into).collect();
         self
     }
 

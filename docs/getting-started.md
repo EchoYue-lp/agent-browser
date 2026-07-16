@@ -130,7 +130,7 @@ use agent_browser_core::{BrowserEngine, BrowserConfig};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Create browser engine (headed mode shows browser window)
-    let engine = BrowserEngine::new(BrowserConfig::headed())?;
+    let engine = BrowserEngine::new(BrowserConfig::headed());
 
     // Navigate to a page
     engine.navigate("https://example.com").await?;
@@ -150,7 +150,7 @@ async fn main() -> anyhow::Result<()> {
     engine.type_selector("input[name='email']", "hello@example.com", true, None).await?;
 
     // Take screenshot
-    let screenshot = engine.screenshot(None).await?;
+    let screenshot = engine.screenshot().await?;
 
     // Shutdown
     engine.shutdown().await?;
@@ -169,7 +169,7 @@ let config = BrowserConfig::default()
     .with_headless(HeadlessMode::New)  // Chrome 112+ headless, harder to detect
     .with_stealth(true);                // Inject anti-detection scripts
 
-let engine = BrowserEngine::new(config)?;
+let engine = BrowserEngine::new(config);
 ```
 
 #### Custom Configuration
@@ -184,7 +184,7 @@ let config = BrowserConfig::default()
     .with_stealth(true)
     .with_arg("--disable-web-security");
 
-let engine = BrowserEngine::new(config)?;
+let engine = BrowserEngine::new(config);
 ```
 
 ## Environment Variables
@@ -193,10 +193,12 @@ let engine = BrowserEngine::new(config)?;
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `BROWSER_HTTP_HOST` | Bind address | `127.0.0.1` |
 | `BROWSER_HTTP_PORT` | Server port | `3000` |
-| `BROWSER_HEADLESS` | Enable headless mode | `false` |
+| `BROWSER_HEADLESS` | Browser display mode | new headless |
 | `BROWSER_API_KEY` | API key for authentication | - |
 | `BROWSER_DEFAULT_TIMEOUT_MS` | Default timeout in milliseconds | `30000` |
+| `BROWSER_ALLOWED_FILE_ROOTS` | Upload/download roots | current directory and temp directory |
 
 ## Next Steps
 

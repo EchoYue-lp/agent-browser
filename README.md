@@ -273,11 +273,15 @@ Pre-defined prompts for common browser tasks:
 ### Environment Variables (HTTP Server)
 
 ```bash
+BROWSER_HTTP_HOST=127.0.0.1   # Bind address (default: loopback only)
 BROWSER_HTTP_PORT=8080         # Server port (default: 3000)
 BROWSER_HEADLESS=1             # Enable headless mode
 BROWSER_API_KEY=secret123      # API key for authentication
 BROWSER_DEFAULT_TIMEOUT_MS=60000  # Default timeout in ms
+BROWSER_ALLOWED_FILE_ROOTS=/tmp:/path/to/workspace  # Upload/download roots
 ```
+
+Binding to a non-loopback address requires `BROWSER_API_KEY`.
 
 ### Rust Configuration
 
@@ -311,7 +315,7 @@ let config = BrowserConfig::default()
 ┌─────────────────────────────────────────────────────────────────┐
 │                   agent-browser-mcp (MCP Server)                 │
 │  Tools (30+) | Resources | Prompts | Logging                    │
-│  Protocol: 2025-11-25 | Transports: stdio, sse, http            │
+│  Protocol: 2025-11-25 | Transport: stdio                        │
 └────────────────────────────┬────────────────────────────────────┘
                              │ Reuses
                              ▼

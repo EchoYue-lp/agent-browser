@@ -183,10 +183,10 @@ http://localhost:3000
 
 ### Authentication
 
-Optional API key authentication via `Authorization` header:
+Optional API key authentication via `X-API-Key` or Bearer authorization:
 
 ```bash
-curl -H "Authorization: Bearer YOUR_API_KEY" http://localhost:3000/snapshot
+curl -H "X-API-Key: YOUR_API_KEY" http://localhost:3000/snapshot
 ```
 
 ### Endpoints
@@ -200,7 +200,7 @@ Navigate to a URL.
 ```bash
 curl -X POST http://localhost:3000/navigate \
   -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com", "wait_until": "networkidle0"}'
+  -d '{"url": "https://example.com", "wait_until": "networkIdle"}'
 ```
 
 **Response:**
@@ -609,7 +609,7 @@ The main entry point for browser automation.
 use agent_browser_core::{BrowserEngine, BrowserConfig, HeadlessMode};
 
 // Create engine
-let engine = BrowserEngine::new(BrowserConfig::default())?;
+let engine = BrowserEngine::new(BrowserConfig::default());
 
 // Launch browser
 engine.launch().await?;
@@ -633,7 +633,7 @@ engine.type_selector("input#email", "hello@example.com", true, None).await?;
 let text = engine.get_text(".article-title", None).await?;
 
 // Screenshot
-let screenshot = engine.screenshot(None).await?;
+let screenshot = engine.screenshot().await?;
 
 // Execute JavaScript
 let result = engine.evaluate("document.title").await?;
